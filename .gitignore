@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor
+.cursor/
+
+# 日志和数据
+*.log
+*.dat
+
+# 用户配置（包含密码）
+config_local.py
+*_local.py
+data/
+*.con
+cmd
+cmd/
+con
+con/
+config
+config/
+examples
+examples/
+pkg
+pkg/
+*.go
+go.mod
+go.sum
+plan.md
+cmd.md
+pyctp/md_reference.py
+pyctp/td_reference.py
+pyctp/ctp_gateway_reference.py
+WS_PROTOCOL.md
+/Python重写版的详细架构设计.md
+/Python重写版项目初始化代码骨架.md
