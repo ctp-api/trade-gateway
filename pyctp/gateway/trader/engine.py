@@ -1,0 +1,540 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from pyctp.gateway.ctp import CtpTraderAdapter, PybindTdApiAdapter
+from pyctp.gateway.eventbus.bus import Event, EventBus
+from pyctp.gateway.protocol import ProtocolCodec
+from pyctp.gateway.protocol.types import (
+    CancelOrderRequest,
+    InsertOrderRequest,
+    LoginRequest,
+    WsRequest,
+    WsResponse,
+)
+from pyctp.gateway.websocket import WebSocketServer
+
+
+class TraderState(str, Enum):
+    INIT = "init"
+    CONNECTING = "connecting"
+    AUTHENTICATING = "authenticating"
+    LOGGING_IN = "logging_in"
+    CONFIRMING_SETTLEMENT = "confirming_settlement"
+    READY = "ready"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
+@dataclass(slots=True)
+class TraderConfig:
+    host: str = "0.0.0.0"
+    port: int = 7788
+    log_level: str = "INFO"
+    data_dir: Path = field(default_factory=lambda: Path("./data"))
+    ctp_appid: str = "simnow_client_test"
+    ctp_auth_code: str = "0000000000000000"
+
+
+class TraderEngine:
+    def __init__(self, bus: EventBus, config: TraderConfig, ctp: CtpTraderAdapter | None = None) -> None:
+        self.bus = bus
+        self.config = config
+        self.ctp = ctp or CtpTraderAdapter(PybindTdApiAdapter(bus=bus))
+        self.codec = ProtocolCodec()
+        self.ws = WebSocketServer(config.host, config.port, bus)
+        self.state = TraderState.INIT
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._stop_event = asyncio.Event()
+        self._started = False
+        self._pending_login_conn_id: int | None = None
+        self._login_request: LoginRequest | None = None
+        self._order_conn_map: dict[str, int] = {}
+        self._request_seq = 0
+        self._query_pending: dict[str, dict[str, Any]] = {}
+
+    def _next_request_id(self) -> int:
+        self._request_seq += 1
+        return self._request_seq
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self.bus.bind_loop(asyncio.get_running_loop())
+        await self.ws.start()
+        self.state = TraderState.READY
+        self._tasks.append(asyncio.create_task(self._event_loop(), name="trader-event-loop"))
+        self._tasks.append(asyncio.create_task(self._idle_loop(), name="trader-idle-loop"))
+
+    async def run_forever(self) -> None:
+        await self._stop_event.wait()
+
+    async def stop(self) -> None:
+        if self.state in {TraderState.STOPPING, TraderState.STOPPED}:
+            return
+        self.state = TraderState.STOPPING
+        self._stop_event.set()
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        await self.ws.stop()
+        self.state = TraderState.STOPPED
+
+    async def _event_loop(self) -> None:
+        while self.state != TraderState.STOPPED:
+            try:
+                event = await self.bus.get()
+                await self.handle_event(event)
+            except asyncio.CancelledError:
+                break
+
+    async def _idle_loop(self) -> None:
+        while self.state != TraderState.STOPPED:
+            try:
+                await asyncio.sleep(0.1)
+                await self.handle_event(Event(type="timer.idle", source="engine"))
+            except asyncio.CancelledError:
+                break
+
+    async def handle_event(self, event: Event) -> None:
+        if event.type == "ws.connected":
+            conn_id = event.conn_id or 0
+            await self.ws.send_to(conn_id, self.codec.build_notify(0, f"connected: {conn_id}"))
+            return
+
+        if event.type == "ws.message":
+            conn_id = event.conn_id or 0
+            raw = str(event.payload.get("message", ""))
+            try:
+                req = self.codec.parse_request(raw, conn_id=conn_id)
+            except Exception as exc:
+                await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="error", ok=False, code=400, msg=str(exc), conn_id=conn_id, request_id=self._next_request_id())))
+                return
+
+            resp = await self.dispatch_request(req)
+            await self.ws.send_to(conn_id, self.codec.build_response(resp))
+            return
+
+        if event.type == "ctp.rsp_authenticate":
+            await self._on_rsp_authenticate(event)
+            return
+
+        if event.type == "ctp.rsp_user_login":
+            await self._on_rsp_user_login(event)
+            return
+
+        if event.type == "ctp.rsp_settlement_info_confirm":
+            await self._on_rsp_settlement_info_confirm(event)
+            return
+
+        if event.type == "ctp.rsp_qry_trading_account":
+            await self._on_query_result(event, "account")
+            return
+
+        if event.type == "ctp.rsp_qry_investor_position":
+            await self._on_query_result(event, "position")
+            return
+
+        if event.type == "ctp.rsp_qry_order":
+            await self._on_query_result(event, "order")
+            return
+
+        if event.type == "ctp.rsp_qry_trade":
+            await self._on_query_result(event, "trade")
+            return
+
+        if event.type == "ctp.rsp_qry_instrument":
+            await self._on_query_result(event, "instrument")
+            return
+
+        if event.type == "ctp.rsp_order_insert":
+            await self._on_rsp_order_insert(event)
+            return
+
+        if event.type == "ctp.err_order_insert":
+            await self._on_err_rtn_order_insert(event)
+            return
+
+        if event.type == "ctp.rsp_order_action":
+            await self._on_rsp_order_action(event)
+            return
+
+        if event.type == "ctp.rtn_order":
+            await self._on_rtn_order(event)
+            return
+
+        if event.type == "ctp.rtn_trade":
+            await self._on_rtn_trade(event)
+            return
+
+    def _extract_payload(self, req: WsRequest) -> dict[str, Any]:
+        payload = req.raw.get("data")
+        if not isinstance(payload, dict):
+            raise ValueError("missing data payload")
+        return payload
+
+    def _mk_response(self, aid: str, req: WsRequest, ok: bool, code: int, msg: str, data: dict[str, Any] | None = None, request_id: int | None = None) -> WsResponse:
+        return WsResponse(aid=aid, ok=ok, code=code, msg=msg, data=data or {}, conn_id=req.conn_id, request_id=request_id or self._next_request_id())
+
+    async def dispatch_request(self, req: WsRequest) -> WsResponse:
+        if req.aid == "req_login":
+            login = self.codec.parse_login(req)
+            login.appid = login.appid or self.config.ctp_appid
+            login.auth_code = login.auth_code or self.config.ctp_auth_code
+            return await self.handle_req_login(req, login)
+        if req.aid == "insert_order":
+            order = self.codec.parse_insert_order(req)
+            return await self.handle_insert_order(req, order)
+        if req.aid == "cancel_order":
+            cancel = self.codec.parse_cancel_order(req)
+            return await self.handle_cancel_order(req, cancel)
+        if req.aid == "query_trading_account":
+            return await self.handle_query_trading_account(req)
+        if req.aid == "query_investor_position":
+            return await self.handle_query_investor_position(req)
+        if req.aid == "query_order":
+            return await self.handle_query_order(req)
+        if req.aid == "query_trade":
+            return await self.handle_query_trade(req)
+        if req.aid == "query_instrument":
+            return await self.handle_query_instrument(req)
+
+        handler = getattr(self, f"handle_{req.aid}", None)
+        if handler is None:
+            return self._mk_response(req.aid, req, False, 404, f"unsupported aid: {req.aid}")
+        result = handler(req)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if isinstance(result, WsResponse):
+            result.request_id = result.request_id or self._next_request_id()
+            return result
+        return self._mk_response(req.aid, req, True, 0, "ok", result or {})
+
+    async def handle_req_login(self, req: WsRequest, login: LoginRequest) -> WsResponse:
+        if not login.user_name or not login.password:
+            return self._mk_response(req.aid, req, False, 400, "missing user_name or password")
+        if not login.broker_id or not login.front:
+            return self._mk_response(req.aid, req, False, 400, "missing broker_id or front")
+
+        self._pending_login_conn_id = req.conn_id
+        self._login_request = login
+        self.state = TraderState.CONNECTING
+
+        try:
+            self.ctp.connect(login.front, login.user_name, login.password, login.broker_id, login.auth_code, login.appid)
+        except Exception as exc:
+            self.state = TraderState.READY
+            return self._mk_response(req.aid, req, False, 500, f"ctp connect failed: {exc}")
+
+        return self._mk_response(req.aid, req, True, 0, "login request accepted", {"user_name": login.user_name, "broker_id": login.broker_id, "front": login.front, "appid": login.appid, "auth_code": login.auth_code, "status": "connecting"})
+
+    async def handle_query_trading_account(self, req: WsRequest) -> WsResponse:
+        try:
+            self.ctp.clear_query_rows("account")
+            request_id = self._next_request_id()
+            self._query_pending["account"] = {"conn_id": req.conn_id, "request_id": request_id, "rows": []}
+            self.ctp.query_trading_account()
+        except Exception as exc:
+            self._query_pending.pop("account", None)
+            return self._mk_response(req.aid, req, False, 500, f"ctp query trading account failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
+        return self._mk_response(req.aid, req, True, 0, "query trading account accepted", {"status": "pending"}, request_id=request_id)
+
+    async def handle_query_investor_position(self, req: WsRequest) -> WsResponse:
+        try:
+            self.ctp.clear_query_rows("position")
+            request_id = self._next_request_id()
+            self._query_pending["position"] = {"conn_id": req.conn_id, "request_id": request_id, "rows": []}
+            self.ctp.query_investor_position()
+        except Exception as exc:
+            self._query_pending.pop("position", None)
+            return self._mk_response(req.aid, req, False, 500, f"ctp query investor position failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
+        return self._mk_response(req.aid, req, True, 0, "query investor position accepted", {"status": "pending"}, request_id=request_id)
+
+    async def handle_query_order(self, req: WsRequest) -> WsResponse:
+        try:
+            self.ctp.clear_query_rows("order")
+            request_id = self._next_request_id()
+            self._query_pending["order"] = {"conn_id": req.conn_id, "request_id": request_id, "rows": []}
+            self.ctp.query_order()
+        except Exception as exc:
+            self._query_pending.pop("order", None)
+            return self._mk_response(req.aid, req, False, 500, f"ctp query order failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
+        return self._mk_response(req.aid, req, True, 0, "query order accepted", {"status": "pending"}, request_id=request_id)
+
+    async def handle_query_trade(self, req: WsRequest) -> WsResponse:
+        try:
+            self.ctp.clear_query_rows("trade")
+            request_id = self._next_request_id()
+            self._query_pending["trade"] = {"conn_id": req.conn_id, "request_id": request_id, "rows": []}
+            self.ctp.query_trade()
+        except Exception as exc:
+            self._query_pending.pop("trade", None)
+            return self._mk_response(req.aid, req, False, 500, f"ctp query trade failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
+        return self._mk_response(req.aid, req, True, 0, "query trade accepted", {"status": "pending"}, request_id=request_id)
+
+    async def handle_query_instrument(self, req: WsRequest) -> WsResponse:
+        payload = self._extract_payload(req)
+        instrument_id = str(payload.get("instrument_id", ""))
+        try:
+            self.ctp.clear_query_rows("instrument")
+            request_id = self._next_request_id()
+            self._query_pending["instrument"] = {"conn_id": req.conn_id, "request_id": request_id, "rows": [], "instrument_id": instrument_id}
+            self.ctp.query_instrument(instrument_id)
+        except Exception as exc:
+            self._query_pending.pop("instrument", None)
+            return self._mk_response(req.aid, req, False, 500, f"ctp query instrument failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
+        return self._mk_response(req.aid, req, True, 0, "query instrument accepted", {"status": "pending", "instrument_id": instrument_id}, request_id=request_id)
+
+    async def _on_rsp_authenticate(self, event: Event) -> None:
+        payload = event.payload
+        error = payload.get("error", {}) or {}
+        data = payload.get("data", {}) or {}
+        conn_id = self._pending_login_conn_id or 0
+        if int(error.get("ErrorID", 0)) != 0:
+            self.state = TraderState.READY
+            request_id = int((self._query_pending.get("account", {}) or {}).get("request_id") or self._next_request_id())
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"authenticate failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=request_id)))
+            return
+        self.state = TraderState.AUTHENTICATING
+        self.ctp.login()
+
+    async def _on_rsp_user_login(self, event: Event) -> None:
+        payload = event.payload
+        error = payload.get("error", {}) or {}
+        data = payload.get("data", {}) or {}
+        conn_id = self._pending_login_conn_id or 0
+        if int(error.get("ErrorID", 0)) != 0:
+            self.state = TraderState.READY
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=self._next_request_id())))
+            return
+        self.state = TraderState.CONFIRMING_SETTLEMENT
+        await self.ws.send_to(conn_id, self.codec.build_notify(0, "login success, confirming settlement..."))
+
+    async def _on_rsp_settlement_info_confirm(self, event: Event) -> None:
+        payload = event.payload
+        error = payload.get("error", {}) or {}
+        data = payload.get("data", {}) or {}
+        conn_id = self._pending_login_conn_id or 0
+        if int(error.get("ErrorID", 0)) != 0:
+            self.state = TraderState.READY
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=self._next_request_id())))
+            return
+        self.state = TraderState.READY
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=self._next_request_id())))
+        self._pending_login_conn_id = None
+        self._login_request = None
+
+    async def _on_query_result(self, event: Event, kind: str) -> None:
+        payload = event.payload
+        data = payload.get("data", {}) or {}
+        error = payload.get("error", {}) or {}
+        last = bool(payload.get("last", False))
+        pending = self._query_pending.setdefault(kind, {})
+        if int(error.get("ErrorID", 0)) == 0:
+            pending.setdefault("rows", []).append(data)
+        if not last:
+            return
+        conn_id = int(pending.get("conn_id") or self._pending_login_conn_id or 0)
+        rows = self._normalize_query_rows(kind, list(pending.get("rows", [])))
+        response = WsResponse(
+            aid=f"query_{kind}",
+            ok=int(error.get("ErrorID", 0)) == 0,
+            code=0 if int(error.get("ErrorID", 0)) == 0 else int(error.get("ErrorID", 500) or 500),
+            msg=error.get("ErrorMsg", "ok" if int(error.get("ErrorID", 0)) == 0 else "unknown"),
+            data={"rows": rows, "count": len(rows)},
+            conn_id=conn_id,
+            request_id=int(pending.get("request_id") or self._next_request_id()),
+        )
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.build_response(response))
+        self._query_pending.pop(kind, None)
+
+    async def _on_rsp_order_insert(self, event: Event) -> None:
+        payload = event.payload
+        data = payload.get("data", {}) or {}
+        error = payload.get("error", {}) or {}
+        order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
+        conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if int(error.get("ErrorID", 0)) != 0:
+            await self._send_order_error(conn_id, "rsp_order_insert", order_ref, data, error)
+            return
+        await self._push_order_event(conn_id, "rsp_order_insert", data)
+
+    async def _on_err_rtn_order_insert(self, event: Event) -> None:
+        payload = event.payload
+        data = payload.get("data", {}) or {}
+        error = payload.get("error", {}) or {}
+        order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
+        conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        await self._send_order_error(conn_id, "err_rtn_order_insert", order_ref, data, error)
+
+    async def _on_rsp_order_action(self, event: Event) -> None:
+        payload = event.payload
+        data = payload.get("data", {}) or {}
+        error = payload.get("error", {}) or {}
+        order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
+        conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if int(error.get("ErrorID", 0)) != 0:
+            await self._send_order_error(conn_id, "rsp_order_action", order_ref, data, error)
+            return
+        await self._push_order_event(conn_id, "rsp_order_action", data)
+
+    async def _on_rtn_order(self, event: Event) -> None:
+        data = event.payload.get("data", {}) or {}
+        order_ref = str(data.get("OrderRef", ""))
+        conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        await self.ws.broadcast(self.codec.dumps({"aid": "rtn_order", "ok": True, "data": data}))
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "notify", "code": 0, "msg": "rtn_order received", "level": "INFO", "msg_type": "ORDER", "data": data}))
+
+    async def _on_rtn_trade(self, event: Event) -> None:
+        data = event.payload.get("data", {}) or {}
+        order_ref = str(data.get("OrderRef", ""))
+        conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        await self.ws.broadcast(self.codec.dumps({"aid": "rtn_trade", "ok": True, "data": data}))
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "notify", "code": 0, "msg": "rtn_trade received", "level": "INFO", "msg_type": "TRADE", "data": data}))
+
+    async def _push_order_event(self, conn_id: int, aid: str, data: dict[str, Any]) -> None:
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": aid, "ok": True, "data": data}))
+
+    async def _send_order_error(self, conn_id: int, aid: str, order_ref: str, data: dict[str, Any], error: dict[str, Any]) -> None:
+        payload = {"aid": aid, "ok": False, "code": int(error.get("ErrorID", 500) or 500), "msg": error.get("ErrorMsg", "unknown"), "data": {"order_ref": order_ref, "data": data, "error": error}}
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.dumps(payload))
+
+    @staticmethod
+    def _normalize_query_row(kind: str, row: dict[str, Any]) -> dict[str, Any]:
+        if kind == "account":
+            return {
+                "account_id": str(row.get("AccountID", "")),
+                "pre_balance": float(row.get("PreBalance", 0.0) or 0.0),
+                "deposit": float(row.get("Deposit", 0.0) or 0.0),
+                "withdraw": float(row.get("Withdraw", 0.0) or 0.0),
+                "frozen_margin": float(row.get("FrozenMargin", row.get("CurrMargin", 0.0)) or 0.0),
+                "frozen_cash": float(row.get("FrozenCash", 0.0) or 0.0),
+                "frozen_commission": float(row.get("FrozenCommission", 0.0) or 0.0),
+                "margin": float(row.get("CurrMargin", 0.0) or 0.0),
+                "cash_in": float(row.get("CashIn", 0.0) or 0.0),
+                "commission": float(row.get("Commission", 0.0) or 0.0),
+                "close_profit": float(row.get("CloseProfit", 0.0) or 0.0),
+                "position_profit": float(row.get("PositionProfit", 0.0) or 0.0),
+                "balance": float(row.get("Balance", 0.0) or 0.0),
+                "available": float(row.get("Available", 0.0) or 0.0),
+                "withdraw_quota": float(row.get("WithdrawQuota", 0.0) or 0.0),
+                "reserve_balance": float(row.get("ReserveBalance", 0.0) or 0.0),
+                "currency_id": str(row.get("CurrencyID", "CNY")),
+                "trading_day": str(row.get("TradingDay", "")),
+                "settlement_id": int(row.get("SettlementID", 0) or 0),
+                "raw": row,
+            }
+        if kind == "position":
+            return {
+                "instrument_id": str(row.get("InstrumentID", "")),
+                "exchange_id": str(row.get("ExchangeID", "")),
+                "posi_direction": str(row.get("PosiDirection", "")),
+                "position": int(row.get("Position", 0) or 0),
+                "yd_position": int(row.get("YdPosition", 0) or 0),
+                "today_position": int(row.get("TodayPosition", 0) or 0),
+                "long_frozen": int(row.get("LongFrozen", 0) or 0),
+                "short_frozen": int(row.get("ShortFrozen", 0) or 0),
+                "open_cost": float(row.get("OpenCost", 0.0) or 0.0),
+                "position_cost": float(row.get("PositionCost", 0.0) or 0.0),
+                "position_profit": float(row.get("PositionProfit", 0.0) or 0.0),
+                "open_amount": float(row.get("OpenAmount", 0.0) or 0.0),
+                "close_amount": float(row.get("CloseAmount", 0.0) or 0.0),
+                "position_margin": float(row.get("PositionMargin", 0.0) or 0.0),
+                "raw": row,
+            }
+        if kind == "order":
+            return {
+                "order_ref": str(row.get("OrderRef", "")),
+                "instrument_id": str(row.get("InstrumentID", "")),
+                "exchange_id": str(row.get("ExchangeID", "")),
+                "direction": str(row.get("Direction", "")),
+                "comb_offset_flag": str(row.get("CombOffsetFlag", "")),
+                "comb_hedge_flag": str(row.get("CombHedgeFlag", "")),
+                "limit_price": float(row.get("LimitPrice", 0.0) or 0.0),
+                "volume_total_original": int(row.get("VolumeTotalOriginal", 0) or 0),
+                "volume_traded": int(row.get("VolumeTraded", 0) or 0),
+                "volume_total": int(row.get("VolumeTotal", 0) or 0),
+                "time_condition": str(row.get("TimeCondition", "")),
+                "volume_condition": str(row.get("VolumeCondition", "")),
+                "contingent_condition": str(row.get("ContingentCondition", "")),
+                "force_close_reason": str(row.get("ForceCloseReason", "")),
+                "order_submit_status": str(row.get("OrderSubmitStatus", "")),
+                "order_status": str(row.get("OrderStatus", "")),
+                "order_sys_id": str(row.get("OrderSysID", "")),
+                "order_local_id": str(row.get("OrderLocalID", "")).strip(),
+                "front_id": int(row.get("FrontID", 0) or 0),
+                "session_id": int(row.get("SessionID", 0) or 0),
+                "status_msg": str(row.get("StatusMsg", "")),
+                "insert_date": str(row.get("InsertDate", "")),
+                "insert_time": str(row.get("InsertTime", "")),
+                "update_time": str(row.get("UpdateTime", "")),
+                "cancel_time": str(row.get("CancelTime", "")),
+                "raw": row,
+            }
+        if kind == "trade":
+            return {
+                "trade_id": str(row.get("TradeID", "")),
+                "order_ref": str(row.get("OrderRef", "")),
+                "instrument_id": str(row.get("InstrumentID", "")),
+                "exchange_id": str(row.get("ExchangeID", "")),
+                "direction": str(row.get("Direction", "")),
+                "offset_flag": str(row.get("OffsetFlag", "")),
+                "hedge_flag": str(row.get("HedgeFlag", "")),
+                "price": float(row.get("Price", 0.0) or 0.0),
+                "volume": int(row.get("Volume", 0) or 0),
+                "trade_date": str(row.get("TradeDate", "")),
+                "trade_time": str(row.get("TradeTime", "")),
+                "trade_type": str(row.get("TradeType", "")),
+                "raw": row,
+            }
+        if kind == "instrument":
+            return {
+                "instrument_id": str(row.get("InstrumentID", "")),
+                "exchange_id": str(row.get("ExchangeID", "")),
+                "instrument_name": str(row.get("InstrumentName", "")),
+                "product_class": str(row.get("ProductClass", "")),
+                "volume_multiple": int(row.get("VolumeMultiple", 1) or 1),
+                "price_tick": float(row.get("PriceTick", 0.0) or 0.0),
+                "expire_date": str(row.get("ExpireDate", "")),
+                "delivery_year": int(row.get("DeliveryYear", 0) or 0),
+                "delivery_month": int(row.get("DeliveryMonth", 0) or 0),
+                "raw": row,
+            }
+        return {"raw": row}
+
+    @staticmethod
+    def _normalize_query_rows(kind: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [TraderEngine._normalize_query_row(kind, row) for row in rows]
+
+    def handle_ping(self, req: WsRequest) -> WsResponse:
+        return WsResponse(aid="ping", ok=True, msg="pong", data={"pong": True}, conn_id=req.conn_id, request_id=self._next_request_id())
+
+    def handle_echo(self, req: WsRequest) -> WsResponse:
+        return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=self._next_request_id())
+
+    @staticmethod
+    def _map_direction(direction: str, offset: str) -> str | None:
+        d = direction.upper()
+        o = offset.upper()
+        if d == "BUY" and o == "OPEN":
+            return "BUY_OPEN"
+        if d == "BUY" and o in {"CLOSE", "CLOSE_TODAY"}:
+            return "BUY_CLOSE_TODAY" if o == "CLOSE_TODAY" else "BUY_CLOSE"
+        if d == "SELL" and o == "OPEN":
+            return "SELL_OPEN"
+        if d == "SELL" and o in {"CLOSE", "CLOSE_TODAY"}:
+            return "SELL_CLOSE_TODAY" if o == "CLOSE_TODAY" else "SELL_CLOSE"
+        return None
