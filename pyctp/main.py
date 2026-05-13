@@ -19,11 +19,11 @@ async def run() -> int | None:
 
     bus = EventBus()
     trader = TraderEngine(bus=bus, config=config)
-    market_ws = WebSocketServer(config.market_host if hasattr(config, "market_host") else config.host, getattr(config, "market_port", 7789), bus)
+    market_ws = WebSocketServer(getattr(config, "market_host", config.host), getattr(config, "market_port", 7789), bus)
     market = MarketEngine(
         bus=bus,
         feed=MarketFeedAdapter(PybindMdApiAdapter(bus=bus), bus=bus),
-        config=MarketConfig(data_dir=config.data_dir, log_level=config.log_level, md_front=getattr(config, "md_front", ""), broker_id=getattr(config, "broker_id", ""), user_name=getattr(config, "user_name", ""), password=getattr(config, "password", ""), auth_code=getattr(config, "auth_code", ""), appid=getattr(config, "appid", "")),
+        config=MarketConfig(data_dir=config.data_dir, log_level=config.log_level, md_front=getattr(config, "md_front", ""), broker_id=getattr(config, "broker_id", ""), user_name=getattr(config, "user_name", ""), password=getattr(config, "password", ""), auth_code=getattr(config, "auth_code", ""), appid=getattr(config, "appid", ""), host=getattr(config, "market_host", getattr(config, "host", "0.0.0.0")), port=getattr(config, "market_port", 7789)),
         ws=market_ws,
     )
 

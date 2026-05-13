@@ -14,6 +14,8 @@ def load_config(path: Path) -> AppConfig:
     return AppConfig(
         host=data.get("host", "0.0.0.0"),
         port=int(data.get("port", 7788)),
+        market_host=data.get("market_host", data.get("host", "0.0.0.0")),
+        market_port=int(data.get("market_port", 7789)),
         log_level=str(data.get("log_level", "INFO")),
         data_dir=Path(data.get("data_dir", "./data")),
         ctp_appid=str(data.get("ctp_appid", "simnow_client_test")),
