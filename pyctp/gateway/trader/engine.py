@@ -118,7 +118,10 @@ class TraderEngine:
                 await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="error", ok=False, code=400, msg=str(exc), conn_id=conn_id, request_id=self._next_request_id())))
                 return
 
+            req.request_id = self._next_request_id()
             resp = await self.dispatch_request(req)
+            if resp.request_id is None:
+                resp.request_id = req.request_id
             await self.ws.send_to(conn_id, self.codec.build_response(resp))
             return
 
@@ -181,7 +184,7 @@ class TraderEngine:
         return payload
 
     def _mk_response(self, aid: str, req: WsRequest, ok: bool, code: int, msg: str, data: dict[str, Any] | None = None, request_id: int | None = None) -> WsResponse:
-        return WsResponse(aid=aid, ok=ok, code=code, msg=msg, data=data or {}, conn_id=req.conn_id, request_id=request_id or self._next_request_id())
+        return WsResponse(aid=aid, ok=ok, code=code, msg=msg, data=data or {}, conn_id=req.conn_id, request_id=request_id if request_id is not None else req.request_id)
 
     async def dispatch_request(self, req: WsRequest) -> WsResponse:
         if req.aid == "req_login":
@@ -312,7 +315,7 @@ class TraderEngine:
         conn_id = self._pending_login_conn_id or 0
         if int(error.get("ErrorID", 0)) != 0:
             self.state = TraderState.READY
-            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=self._next_request_id())))
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self.state = TraderState.CONFIRMING_SETTLEMENT
         await self.ws.send_to(conn_id, self.codec.build_notify(0, "login success, confirming settlement..."))
@@ -324,11 +327,11 @@ class TraderEngine:
         conn_id = self._pending_login_conn_id or 0
         if int(error.get("ErrorID", 0)) != 0:
             self.state = TraderState.READY
-            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=self._next_request_id())))
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self.state = TraderState.READY
         if conn_id:
-            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=self._next_request_id())))
+            await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=event.request_id)))
         self._pending_login_conn_id = None
         self._login_request = None
 
@@ -344,14 +347,21 @@ class TraderEngine:
             return
         conn_id = int(pending.get("conn_id") or self._pending_login_conn_id or 0)
         rows = self._normalize_query_rows(kind, list(pending.get("rows", [])))
+        response_kind = {
+            "account": "query_account",
+            "position": "query_position",
+            "order": "query_order",
+            "trade": "query_trade",
+            "instrument": "query_instrument",
+        }.get(kind, f"query_{kind}")
         response = WsResponse(
-            aid=f"query_{kind}",
+            aid=response_kind,
             ok=int(error.get("ErrorID", 0)) == 0,
             code=0 if int(error.get("ErrorID", 0)) == 0 else int(error.get("ErrorID", 500) or 500),
             msg=error.get("ErrorMsg", "ok" if int(error.get("ErrorID", 0)) == 0 else "unknown"),
             data={"rows": rows, "count": len(rows)},
             conn_id=conn_id,
-            request_id=int(pending.get("request_id") or self._next_request_id()),
+            request_id=int(pending.get("request_id") or event.request_id or self._next_request_id()),
         )
         if conn_id:
             await self.ws.send_to(conn_id, self.codec.build_response(response))
@@ -520,10 +530,10 @@ class TraderEngine:
         return [TraderEngine._normalize_query_row(kind, row) for row in rows]
 
     def handle_ping(self, req: WsRequest) -> WsResponse:
-        return WsResponse(aid="ping", ok=True, msg="pong", data={"pong": True}, conn_id=req.conn_id, request_id=self._next_request_id())
+        return WsResponse(aid="ping", ok=True, msg="pong", data={"pong": True}, conn_id=req.conn_id, request_id=req.request_id)
 
     def handle_echo(self, req: WsRequest) -> WsResponse:
-        return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=self._next_request_id())
+        return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=req.request_id)
 
     @staticmethod
     def _map_direction(direction: str, offset: str) -> str | None:
