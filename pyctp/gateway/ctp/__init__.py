@@ -1,7 +1,11 @@
 from .adapter import (
     CtpTraderAdapter,
+    MarketApiPort,
+    MarketFeedAdapter,
+    MarketLoginResult,
     OrderCancelResult,
     OrderInsertResult,
+    PybindMdApiAdapter,
     PybindTdApiAdapter,
     QueryResult,
     TdSpiBridge,
@@ -11,8 +15,12 @@ from .adapter import (
 
 __all__ = [
     "CtpTraderAdapter",
+    "MarketApiPort",
+    "MarketFeedAdapter",
+    "MarketLoginResult",
     "OrderCancelResult",
     "OrderInsertResult",
+    "PybindMdApiAdapter",
     "PybindTdApiAdapter",
     "QueryResult",
     "TdSpiBridge",
