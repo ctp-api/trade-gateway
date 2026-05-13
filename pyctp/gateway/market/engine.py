@@ -154,22 +154,23 @@ class MarketEngine:
         except Exception as exc:
             await self.ws.send_to(conn_id, self.codec.dumps({"aid": "error", "ok": False, "code": 400, "msg": str(exc), "conn_id": conn_id}))
             return
+        request_id = req.request_id or 1
         if req.aid == "market_login":
             login = self.codec.parse_market_login(req)
             await self.login(login)
-            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_login", "ok": True, "code": 0, "msg": "login accepted", "data": {"status": "ready"}, "request_id": req.request_id, "conn_id": conn_id}))
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_login", "ok": True, "code": 0, "msg": "login accepted", "data": {"status": "ready"}, "request_id": request_id, "conn_id": conn_id}))
             await self._restore_client_subscriptions(conn_id)
         elif req.aid == "market_subscribe":
             symbols = self._extract_symbols(req)
             self.attach_client_subscription(conn_id, symbols)
             await self.subscribe(*symbols)
-            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_subscribe", "ok": True, "code": 0, "msg": "accepted", "data": {"symbols": symbols}, "request_id": req.request_id, "conn_id": conn_id}))
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_subscribe", "ok": True, "code": 0, "msg": "accepted", "data": {"symbols": symbols}, "request_id": request_id, "conn_id": conn_id}))
             await self._restore_client_subscriptions(conn_id)
         elif req.aid == "market_unsubscribe":
             symbols = self._extract_symbols(req)
             self.detach_client_subscription(conn_id, symbols)
             await self.unsubscribe(*symbols)
-            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_unsubscribe", "ok": True, "code": 0, "msg": "accepted", "data": {"symbols": symbols}, "request_id": req.request_id, "conn_id": conn_id}))
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_unsubscribe", "ok": True, "code": 0, "msg": "accepted", "data": {"symbols": symbols}, "request_id": request_id, "conn_id": conn_id}))
 
     async def _push_quote_to_clients(self, quote: Quote) -> None:
         message = self._serialize_quote_message(quote)
