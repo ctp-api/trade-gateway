@@ -10,7 +10,7 @@ from pyctp.gateway.eventbus.bus import Event, EventBus
 from pyctp.gateway.market.adapter import MarketFeedAdapter, PybindMdApiAdapter
 from pyctp.gateway.market.models import MarketState, MarketStateMachine, Quote, QuoteStore
 from pyctp.gateway.protocol import ProtocolCodec
-from pyctp.gateway.protocol.types import WsRequest
+from pyctp.gateway.protocol.types import MarketLoginRequest, WsRequest
 from pyctp.gateway.websocket import WebSocketServer
 
 
@@ -67,14 +67,23 @@ class MarketEngine:
         await self.ws.stop()
         self.state_machine.transition_to(MarketState.STOPPED)
 
-    async def login(self) -> None:
+    async def login(self, req: MarketLoginRequest | None = None) -> None:
         if not self.state_machine.can_accept_login():
             return
+        login_req = req or MarketLoginRequest(
+            user_name=self.config.user_name,
+            password=self.config.password,
+            broker_id=self.config.broker_id,
+            front=self.config.md_front,
+            auth_code=self.config.auth_code,
+            appid=self.config.appid,
+        )
         self.state_machine.transition_to(MarketState.LOGGING_IN)
-        if self.config.md_front and self.config.user_name and self.config.broker_id:
-            self.feed.connect(self.config.md_front, self.config.user_name, self.config.password, self.config.broker_id, self.config.auth_code, self.config.appid)
+        if login_req.front and login_req.user_name and login_req.broker_id:
+            self.feed.connect(login_req.front, login_req.user_name, login_req.password, login_req.broker_id, login_req.auth_code, login_req.appid)
         self.feed.login()
         self.state_machine.transition_to(MarketState.READY)
+        await self._restore_subscriptions()
 
     async def subscribe(self, *symbols: str) -> None:
         items = [self._normalize_symbol(symbol) for symbol in symbols if symbol]
@@ -119,6 +128,23 @@ class MarketEngine:
             self.feed.subscribe(sorted(self._subscriptions))
             self._pending_subscriptions.update(self._subscriptions)
 
+    async def _event_router_loop(self) -> None:
+        assert self._event_queue is not None
+        while True:
+            event = await self._event_queue.get()
+            if event.type == "market.quote.update":
+                quote = event.payload.get("quote")
+                if isinstance(quote, Quote):
+                    await self._push_quote_to_clients(quote)
+            elif event.type == "ws.message":
+                await self._handle_ws_message(event)
+            elif event.type == "ws.connected":
+                conn_id = event.conn_id or 0
+                await self.ws.send_to(conn_id, self.codec.build_notify(0, "market ready"))
+                await self._restore_client_subscriptions(conn_id)
+            elif event.type == "ws.disconnected":
+                conn_id = event.conn_id or 0
+                self._conn_subscriptions.pop(conn_id, None)
 
     async def _handle_ws_message(self, event: Event) -> None:
         conn_id = event.conn_id or 0
@@ -126,9 +152,14 @@ class MarketEngine:
         try:
             req = self.codec.parse_request(raw, conn_id=conn_id)
         except Exception as exc:
-            await self.ws.send_to(conn_id, self.codec.build_response({"aid": "error", "ok": False, "code": 400, "msg": str(exc), "conn_id": conn_id}))
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "error", "ok": False, "code": 400, "msg": str(exc), "conn_id": conn_id}))
             return
-        if req.aid == "market_subscribe":
+        if req.aid == "market_login":
+            login = self.codec.parse_market_login(req)
+            await self.login(login)
+            await self.ws.send_to(conn_id, self.codec.dumps({"aid": "market_login", "ok": True, "code": 0, "msg": "login accepted", "data": {"status": "ready"}, "request_id": req.request_id, "conn_id": conn_id}))
+            await self._restore_client_subscriptions(conn_id)
+        elif req.aid == "market_subscribe":
             symbols = self._extract_symbols(req)
             self.attach_client_subscription(conn_id, symbols)
             await self.subscribe(*symbols)

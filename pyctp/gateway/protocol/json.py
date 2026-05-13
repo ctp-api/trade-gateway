@@ -8,6 +8,7 @@ from pyctp.gateway.protocol.types import (
     CancelOrderRequest,
     InsertOrderRequest,
     LoginRequest,
+    MarketLoginRequest,
     WsRequest,
     WsResponse,
 )
@@ -42,6 +43,17 @@ class ProtocolCodec:
     def parse_login(self, req: WsRequest) -> LoginRequest:
         data = self._payload(req)
         return LoginRequest(
+            user_name=str(data.get("user_name", "")),
+            password=str(data.get("password", "")),
+            broker_id=(str(data["broker_id"]) if data.get("broker_id") is not None else None),
+            front=(str(data["front"]) if data.get("front") is not None else None),
+            auth_code=str(data.get("auth_code", "")),
+            appid=str(data.get("appid", "")),
+        )
+
+    def parse_market_login(self, req: WsRequest) -> MarketLoginRequest:
+        data = self._payload(req)
+        return MarketLoginRequest(
             user_name=str(data.get("user_name", "")),
             password=str(data.get("password", "")),
             broker_id=(str(data["broker_id"]) if data.get("broker_id") is not None else None),

@@ -34,6 +34,16 @@ class LoginRequest:
 
 
 @dataclass(slots=True)
+class MarketLoginRequest:
+    user_name: str
+    password: str
+    broker_id: str | None = None
+    front: str | None = None
+    auth_code: str = ""
+    appid: str = ""
+
+
+@dataclass(slots=True)
 class InsertOrderRequest:
     instrument_id: str
     exchange_id: str
