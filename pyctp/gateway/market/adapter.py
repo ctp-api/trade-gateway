@@ -9,7 +9,7 @@ from pyctp.gateway.eventbus.bus import Event, EventBus
 try:
     from pyctp.ctpmd import MdApi  # type: ignore
 except Exception:  # pragma: no cover
-    MdApi = object  # type: ignore
+    MdApi = None  # type: ignore
 
 
 @dataclass(slots=True)
@@ -37,9 +37,17 @@ class MarketApiPort(Protocol):
     def is_subscribed(self, symbol: str) -> bool: ...
 
 
-class MdSpiBridge(MdApi):
+if MdApi is not None:
+    MdSpiBase = MdApi
+else:
+    class MdSpiBase:
+        pass
+
+
+class MdSpiBridge(MdSpiBase):
     def __init__(self, bus: EventBus) -> None:
-        super().__init__()
+        if MdApi is not None:
+            super().__init__()
         self.bus = bus
         self.front = ""
         self.userid = ""
@@ -52,6 +60,7 @@ class MdSpiBridge(MdApi):
         self.reqid = 0
         self._subscribed: set[str] = set()
         self._quote_cache: dict[str, dict[str, Any]] = {}
+        self._api_created = False
 
     def connect(self, address: str, userid: str, password: str, broker_id: str, auth_code: str = "", appid: str = "") -> None:
         self.front = address
@@ -60,32 +69,63 @@ class MdSpiBridge(MdApi):
         self.broker_id = broker_id
         self.auth_code = auth_code
         self.appid = appid
-        self.registerFront(address)
-        self.init()
+        if MdApi is None:
+            raise RuntimeError("ctpmd MdApi is not available")
+        try:
+            ctp_con_dir: Path = Path.cwd().joinpath("con")
+            if not ctp_con_dir.exists():
+                ctp_con_dir.mkdir(parents=True, exist_ok=True)
+            api_path_str = str(ctp_con_dir / "md")
+            if hasattr(self, "createFtdcMdApi"):
+                self.createFtdcMdApi(api_path_str.encode("GBK").decode("utf-8"), False, False, True)
+                self._api_created = True
+            self.registerFront(address)
+            self.init()
+            self.connect_status = True
+            self.bus.publish_threadsafe(Event(type="market.connect_succeeded", source="market", payload={"front": address}))
+        except Exception as exc:
+            self.connect_status = False
+            self.bus.publish_threadsafe(Event(type="market.connect_failed", source="market", payload={"front": address, "error": str(exc)}))
+            raise
 
     def login(self) -> None:
+        if MdApi is None:
+            raise RuntimeError("ctpmd MdApi is not available")
         self.reqid += 1
         req = {"BrokerID": self.broker_id, "UserID": self.userid, "Password": self.password}
-        self.reqUserLogin(req, self.reqid)
+        ret = self.reqUserLogin(req, self.reqid)
+        if ret != 0:
+            self.bus.publish_threadsafe(Event(type="market.login_failed", source="market", payload={"ret_code": ret, "reqid": self.reqid}))
+            raise RuntimeError(f"reqUserLogin failed ret_code={ret}")
+        self.bus.publish_threadsafe(Event(type="market.login_request_sent", source="market", payload={"reqid": self.reqid}))
 
     def subscribe(self, instrument_ids: list[str]) -> None:
         items = [symbol for symbol in instrument_ids if symbol]
         if not items:
             return
         self._subscribed.update(items)
-        self.subscribeMarketData(items)
-        self.bus.publish_threadsafe(Event(type="market.subscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed)}))
+        if MdApi is None:
+            raise RuntimeError("ctpmd MdApi is not available")
+        ret = self.subscribeMarketData(items)
+        self.bus.publish_threadsafe(Event(type="market.subscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "ret_code": ret}))
+        if ret != 0:
+            raise RuntimeError(f"subscribeMarketData failed ret_code={ret}")
 
     def unsubscribe(self, instrument_ids: list[str]) -> None:
         items = [symbol for symbol in instrument_ids if symbol]
         if not items:
             return
         self._subscribed.difference_update(items)
-        self.unSubscribeMarketData(items)
-        self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed)}))
+        if MdApi is None:
+            raise RuntimeError("ctpmd MdApi is not available")
+        ret = self.unSubscribeMarketData(items)
+        self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "ret_code": ret}))
+        if ret != 0:
+            raise RuntimeError(f"unSubscribeMarketData failed ret_code={ret}")
 
     def onFrontConnected(self) -> None:
-        self.bus.publish_threadsafe(Event(type="market.front_connected", source="market", payload={}))
+        self.connect_status = True
+        self.bus.publish_threadsafe(Event(type="market.front_connected", source="market", payload={"front": self.front}))
         if self.userid and self.password and self.broker_id:
             self.login()
 
@@ -96,7 +136,7 @@ class MdSpiBridge(MdApi):
 
     def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         self.login_status = int(error.get("ErrorID", 0)) == 0
-        self.bus.publish_threadsafe(Event(type="market.login_rsp", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last)}))
+        self.bus.publish_threadsafe(Event(type="market.login_rsp", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last), "front": self.front}))
 
     def onRspSubMarketData(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         self.bus.publish_threadsafe(Event(type="market.subscribe.finished", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last)}))
