@@ -15,6 +15,7 @@ class Event:
     request_id: int | None = None
     created_at: float = field(default_factory=time)
     tags: dict[str, Any] = field(default_factory=dict)
+    target: str | None = None
 
 
 class EventBus:
