@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 from typing import Any, Protocol
 
 from pyctp.gateway.eventbus.bus import Event, EventBus
+
+logger = logging.getLogger(__name__)
 
 try:
     from pyctp.ctpmd import MdApi  # type: ignore
@@ -76,11 +79,20 @@ class MdSpiBridge(MdSpiBase):
             if not ctp_con_dir.exists():
                 ctp_con_dir.mkdir(parents=True, exist_ok=True)
             api_path_str = str(ctp_con_dir / "md")
+            self.bus.publish_threadsafe(Event(type="market.connect_start", source="market", payload={"front": address, "api_path": api_path_str}))
             if hasattr(self, "createFtdcMdApi"):
+                self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "createFtdcMdApi.start", "api_path": api_path_str}))
                 self.createFtdcMdApi(api_path_str.encode("GBK").decode("utf-8"), False, False, True)
                 self._api_created = True
+                self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "createFtdcMdApi.done", "api_created": True}))
+            else:
+                self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "createFtdcMdApi.skip", "reason": "not available"}))
+            self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "registerFront.start", "front": address}))
             self.registerFront(address)
+            self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "registerFront.done", "front": address}))
+            self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "init.start", "front": address}))
             self.init()
+            self.bus.publish_threadsafe(Event(type="market.connect_step", source="market", payload={"step": "init.done", "front": address}))
             self.connect_status = True
             self.bus.publish_threadsafe(Event(type="market.connect_succeeded", source="market", payload={"front": address}))
         except Exception as exc:
@@ -100,16 +112,21 @@ class MdSpiBridge(MdSpiBase):
         self.bus.publish_threadsafe(Event(type="market.login_request_sent", source="market", payload={"reqid": self.reqid}))
 
     def subscribe(self, instrument_ids: list[str]) -> None:
-        items = [symbol for symbol in instrument_ids if symbol]
+        items = [self._normalize_symbol(symbol) for symbol in instrument_ids if symbol]
         if not items:
             return
         self._subscribed.update(items)
         if MdApi is None:
             raise RuntimeError("ctpmd MdApi is not available")
-        ret = self.subscribeMarketData(items)
-        self.bus.publish_threadsafe(Event(type="market.subscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "ret_code": ret}))
-        if ret != 0:
-            raise RuntimeError(f"subscribeMarketData failed ret_code={ret}")
+        results: list[dict[str, Any]] = []
+        for symbol in items:
+            ctp_symbol = self._to_ctp_instrument_id(symbol)
+            ret = self.subscribeMarketData(ctp_symbol)
+            results.append({"symbol": symbol, "instrument_id": ctp_symbol, "ret_code": ret})
+            if ret != 0:
+                self.bus.publish_threadsafe(Event(type="market.subscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "results": results}))
+                raise RuntimeError(f"subscribeMarketData failed symbol={symbol} instrument_id={ctp_symbol} ret_code={ret}")
+        self.bus.publish_threadsafe(Event(type="market.subscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "results": results}))
 
     def unsubscribe(self, instrument_ids: list[str]) -> None:
         items = [symbol for symbol in instrument_ids if symbol]
@@ -118,10 +135,15 @@ class MdSpiBridge(MdSpiBase):
         self._subscribed.difference_update(items)
         if MdApi is None:
             raise RuntimeError("ctpmd MdApi is not available")
-        ret = self.unSubscribeMarketData(items)
-        self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "ret_code": ret}))
-        if ret != 0:
-            raise RuntimeError(f"unSubscribeMarketData failed ret_code={ret}")
+        results: list[dict[str, Any]] = []
+        for symbol in items:
+            ctp_symbol = self._to_ctp_instrument_id(symbol)
+            ret = self.unSubscribeMarketData(ctp_symbol)
+            results.append({"symbol": symbol, "instrument_id": ctp_symbol, "ret_code": ret})
+            if ret != 0:
+                self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "results": results}))
+                raise RuntimeError(f"unSubscribeMarketData failed symbol={symbol} instrument_id={ctp_symbol} ret_code={ret}")
+        self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "results": results}))
 
     def onFrontConnected(self) -> None:
         self.connect_status = True
@@ -139,19 +161,54 @@ class MdSpiBridge(MdSpiBase):
         self.bus.publish_threadsafe(Event(type="market.login_rsp", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last), "front": self.front}))
 
     def onRspSubMarketData(self, data: dict, error: dict, reqid: int, last: bool) -> None:
+        instrument_id = str(data.get("InstrumentID", "")) if isinstance(data, dict) else ""
+        exchange_id = str(data.get("ExchangeID", "")) if isinstance(data, dict) else ""
+        logger.info(
+            "market onRspSubMarketData reqid=%s last=%s instrument_id=%s exchange_id=%s error=%s data=%s",
+            reqid,
+            last,
+            instrument_id,
+            exchange_id,
+            error,
+            data,
+        )
         self.bus.publish_threadsafe(Event(type="market.subscribe.finished", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last)}))
 
     def onRspUnSubMarketData(self, data: dict, error: dict, reqid: int, last: bool) -> None:
+        instrument_id = str(data.get("InstrumentID", "")) if isinstance(data, dict) else ""
+        exchange_id = str(data.get("ExchangeID", "")) if isinstance(data, dict) else ""
+        logger.info(
+            "market onRspUnSubMarketData reqid=%s last=%s instrument_id=%s exchange_id=%s error=%s data=%s",
+            reqid,
+            last,
+            instrument_id,
+            exchange_id,
+            error,
+            data,
+        )
         self.bus.publish_threadsafe(Event(type="market.unsubscribe.finished", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last)}))
 
     def onRtnDepthMarketData(self, data: dict[str, Any]) -> None:
         instrument_id = str(data.get("InstrumentID", ""))
         exchange_id = str(data.get("ExchangeID", ""))
+        update_time = str(data.get("UpdateTime", ""))
+        update_millisec = int(data.get("UpdateMillisec", 0) or 0)
+        last_price = data.get("LastPrice", None)
+        logger.info(
+            "market onRtnDepthMarketData instrument_id=%s exchange_id=%s update_time=%s update_millisec=%s last_price=%s",
+            instrument_id,
+            exchange_id,
+            update_time,
+            update_millisec,
+            last_price,
+        )
         if not instrument_id:
+            logger.info("market onRtnDepthMarketData skipped empty instrument_id data=%s", data)
             return
-        symbol = f"{exchange_id}.{instrument_id}" if exchange_id else instrument_id
+        symbol = self._resolve_quote_symbol(exchange_id, instrument_id)
         quote = self._normalize_quote(symbol, exchange_id, instrument_id, data)
         self._quote_cache[symbol] = quote
+        logger.info("market quote cached symbol=%s trading_day=%s update_time=%s last_price=%s", symbol, quote.get("trading_day"), quote.get("update_time"), quote.get("last_price"))
         self.bus.publish_threadsafe(Event(type="market.quote.update", source="market", payload={"quote": quote, "symbol": symbol}))
 
     def get_quote(self, symbol: str) -> dict[str, Any] | None:
@@ -161,7 +218,31 @@ class MdSpiBridge(MdSpiBase):
         return [self._quote_cache[s] for s in symbols if s in self._quote_cache]
 
     def is_subscribed(self, symbol: str) -> bool:
-        return symbol in self._subscribed
+        return self._normalize_symbol(symbol) in self._subscribed
+
+    @staticmethod
+    def _to_ctp_instrument_id(symbol: str) -> str:
+        return symbol.split(".", 1)[1] if "." in symbol else symbol
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        symbol = symbol.strip()
+        if "." not in symbol:
+            return symbol.lower() if symbol[:2].isalpha() else symbol
+        exchange_id, instrument_id = symbol.split(".", 1)
+        exchange_id = exchange_id.strip().upper()
+        instrument_id = instrument_id.strip()
+        if exchange_id == "SHFE":
+            instrument_id = instrument_id.lower()
+        return f"{exchange_id}.{instrument_id}"
+
+    @staticmethod
+    def _resolve_quote_symbol(exchange_id: str, instrument_id: str) -> str:
+        exchange_id = exchange_id.strip().upper()
+        instrument_id = instrument_id.strip()
+        if exchange_id == "SHFE":
+            instrument_id = instrument_id.lower()
+        return f"{exchange_id}.{instrument_id}" if exchange_id else instrument_id
 
     @staticmethod
     def _normalize_quote(symbol: str, exchange_id: str, instrument_id: str, data: dict[str, Any]) -> dict[str, Any]:
