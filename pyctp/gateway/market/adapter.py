@@ -189,27 +189,39 @@ class MdSpiBridge(MdSpiBase):
         self.bus.publish_threadsafe(Event(type="market.unsubscribe.finished", source="market", request_id=int(reqid), payload={"data": data, "error": error, "last": bool(last)}))
 
     def onRtnDepthMarketData(self, data: dict[str, Any]) -> None:
-        instrument_id = str(data.get("InstrumentID", ""))
-        exchange_id = str(data.get("ExchangeID", ""))
-        update_time = str(data.get("UpdateTime", ""))
-        update_millisec = int(data.get("UpdateMillisec", 0) or 0)
-        last_price = data.get("LastPrice", None)
-        logger.info(
-            "market onRtnDepthMarketData instrument_id=%s exchange_id=%s update_time=%s update_millisec=%s last_price=%s",
-            instrument_id,
-            exchange_id,
-            update_time,
-            update_millisec,
-            last_price,
-        )
-        if not instrument_id:
-            logger.info("market onRtnDepthMarketData skipped empty instrument_id data=%s", data)
-            return
-        symbol = self._resolve_quote_symbol(exchange_id, instrument_id)
-        quote = self._normalize_quote(symbol, exchange_id, instrument_id, data)
-        self._quote_cache[symbol] = quote
-        logger.info("market quote cached symbol=%s trading_day=%s update_time=%s last_price=%s", symbol, quote.get("trading_day"), quote.get("update_time"), quote.get("last_price"))
-        self.bus.publish_threadsafe(Event(type="market.quote.update", source="market", payload={"quote": quote, "symbol": symbol}))
+        # 此处要判断是否无效数据，例如非交易时间段的数据，避免无效数据推送给上层
+        if data:
+            # 过滤没有时间戳的异常行情数据
+            # Filter out abnormal market data without timestamps
+            if not data.get("UpdateTime"):
+                logger.debug("Skip market data without timestamps")
+                return
+
+            instrument_id = str(data.get("InstrumentID", ""))
+            exchange_id = str(data.get("ExchangeID", ""))
+            update_time = str(data.get("UpdateTime", ""))
+            update_millisec = int(data.get("UpdateMillisec", 0) or 0)
+            last_price = data.get("LastPrice", None)
+            logger.info(
+                "market onRtnDepthMarketData instrument_id=%s exchange_id=%s update_time=%s update_millisec=%s last_price=%s",
+                instrument_id,
+                exchange_id,
+                update_time,
+                update_millisec,
+                last_price,
+            )
+            if not instrument_id:
+                logger.info("market onRtnDepthMarketData skipped empty instrument_id data=%s", data)
+                return
+            symbol = self._resolve_quote_symbol(exchange_id, instrument_id)
+            quote = self._normalize_quote(symbol, exchange_id, instrument_id, data)
+            self._quote_cache[symbol] = quote
+            logger.info("market quote cached symbol=%s trading_day=%s update_time=%s last_price=%s", symbol,
+                        quote.get("trading_day"),
+                        quote.get("update_time"),
+                        quote.get("last_price")
+                        )
+            self.bus.publish_threadsafe(Event(type="market.quote.update", source="market", payload={"quote": quote, "symbol": symbol}))
 
     def get_quote(self, symbol: str) -> dict[str, Any] | None:
         return self._quote_cache.get(symbol)
