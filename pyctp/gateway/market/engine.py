@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -203,6 +203,32 @@ class MarketEngine:
                 logger.debug("market event type=%s conn_id=%s request_id=%s", event.type, event.conn_id, event.request_id)
                 if event.type == "market.quote.update":
                     quote = event.payload.get("quote")
+                    if isinstance(quote, dict):
+                        quote = Quote(
+                            symbol=str(quote.get("symbol", "")),
+                            exchange_id=str(quote.get("exchange_id", "")),
+                            instrument_id=str(quote.get("instrument_id", "")),
+                            last_price=float(quote.get("last_price", 0.0) or 0.0),
+                            pre_close=float(quote.get("pre_close", 0.0) or 0.0),
+                            open_price=float(quote.get("open_price", 0.0) or 0.0),
+                            highest_price=float(quote.get("highest_price", 0.0) or 0.0),
+                            lowest_price=float(quote.get("lowest_price", 0.0) or 0.0),
+                            bid_price1=float(quote.get("bid_price1", 0.0) or 0.0),
+                            bid_volume1=int(quote.get("bid_volume1", 0) or 0),
+                            ask_price1=float(quote.get("ask_price1", 0.0) or 0.0),
+                            ask_volume1=int(quote.get("ask_volume1", 0) or 0),
+                            volume=int(quote.get("volume", 0) or 0),
+                            open_interest=float(quote.get("open_interest", 0.0) or 0.0),
+                            settlement_price=float(quote.get("settlement_price", 0.0) or 0.0),
+                            pre_settlement_price=float(quote.get("pre_settlement_price", 0.0) or 0.0),
+                            upper_limit_price=float(quote.get("upper_limit_price", 0.0) or 0.0),
+                            lower_limit_price=float(quote.get("lower_limit_price", 0.0) or 0.0),
+                            action_day=str(quote.get("action_day", "")),
+                            trading_day=str(quote.get("trading_day", "")),
+                            update_time=str(quote.get("update_time", "")),
+                            update_millisec=int(quote.get("update_millisec", 0) or 0),
+                            raw=quote.get("raw") if isinstance(quote.get("raw"), dict) else None,
+                        )
                     if isinstance(quote, Quote):
                         await self._push_quote_to_clients(quote)
                 elif event.type == "ws.message":
@@ -284,16 +310,22 @@ class MarketEngine:
             await self._send_market_response(conn_id, req.aid, request_id, False, f"unsupported aid: {req.aid}", code=404)
 
     async def _push_quote_to_clients(self, quote: Quote) -> None:
-        message = self._serialize_quote_message(quote)
         matched = False
+        logger.info("market push quote start symbol=%s conn_count=%s", quote.symbol, len(self._conn_subscriptions))
         for conn_id, symbols in self._conn_subscriptions.items():
-            if quote.symbol in symbols:
-                logger.info("market pushing quote conn_id=%s symbol=%s", conn_id, quote.symbol)
-                await self.ws.send_to(conn_id, message)
+            logger.info("market push quote inspect conn_id=%s quote_symbol=%s subscribed_symbols=%s", conn_id, quote.symbol, sorted(symbols))
+            client_symbol = self._resolve_client_symbol(quote.symbol, symbols)
+            logger.info("market push quote resolved conn_id=%s quote_symbol=%s client_symbol=%s", conn_id, quote.symbol, client_symbol)
+            if client_symbol is not None:
+                payload = self._serialize_quote_message(quote, symbol=client_symbol)
+                logger.info("market pushing quote conn_id=%s payload_symbol=%s", conn_id, client_symbol)
+                await self.ws.send_to(conn_id, payload)
                 matched = True
-        if not matched and not self._conn_subscriptions:
-            logger.info("market broadcasting quote symbol=%s", quote.symbol)
-            await self.ws.broadcast(message)
+        if not matched:
+            logger.info("market push quote no match quote_symbol=%s conn_count=%s", quote.symbol, len(self._conn_subscriptions))
+            if not self._conn_subscriptions:
+                logger.info("market broadcasting quote symbol=%s", quote.symbol)
+                await self.ws.broadcast(self._serialize_quote_message(quote))
 
     def attach_client_subscription(self, conn_id: int, symbols: list[str]) -> None:
         normalized = {self._normalize_symbol(symbol) for symbol in symbols if symbol}
@@ -346,19 +378,29 @@ class MarketEngine:
         return f"{exchange_id}.{instrument_id}"
 
     @staticmethod
-    def _serialize_quote_message(quote: Quote) -> str:
+    def _resolve_client_symbol(quote_symbol: str, subscribed_symbols: set[str]) -> str | None:
+        normalized_quote_symbol = quote_symbol.strip()
+        if normalized_quote_symbol in subscribed_symbols:
+            return normalized_quote_symbol
+        instrument_id = normalized_quote_symbol.split(".", 1)[-1]
+        for symbol in subscribed_symbols:
+            if symbol.split(".", 1)[-1].lower() == instrument_id.lower():
+                return symbol
+        return None
+
+    @staticmethod
+    def _serialize_quote_message(quote: Quote, symbol: str | None = None) -> str:
+        resolved_symbol = symbol or quote.symbol
+        quote_data = asdict(quote) if is_dataclass(quote) else (quote.__dict__ if hasattr(quote, "__dict__") else quote)
+        if isinstance(quote_data, dict):
+            quote_data = {**quote_data, "symbol": resolved_symbol}
         payload = {
             "aid": "market_quote",
             "ok": True,
             "code": 0,
             "msg": "ok",
             "data": {
-                "quote": quote.__dict__ if hasattr(quote, "__dict__") else quote,
-                "symbol": quote.symbol,
-                "exchange_id": quote.exchange_id,
-                "instrument_id": quote.instrument_id,
-                "trading_day": quote.trading_day,
-                "update_time": quote.update_time,
+                "quote": quote_data,
             },
             "request_id": None,
             "conn_id": None,
