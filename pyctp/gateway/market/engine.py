@@ -47,6 +47,7 @@ class MarketEngine:
         self._pending_login_conn_by_reqid: dict[int, int] = {}
         self._pending_login_conn_id: int | None = None
         self._pending_login_request_id: int | None = None
+        self._login_timeout_task: asyncio.Task[None] | None = None
         self._on_quotes: Callable[[list[Quote]], Awaitable[None]] | None = None
         self._started = False
         self._router_task: asyncio.Task[None] | None = None
@@ -97,10 +98,13 @@ class MarketEngine:
             if login_req.front and login_req.user_name and login_req.broker_id:
                 logger.info("market connecting front=%s", login_req.front)
                 self.feed.connect(login_req.front, login_req.user_name, login_req.password, login_req.broker_id, login_req.auth_code, login_req.appid)
+                logger.info("market connect returned front=%s", login_req.front)
+                self._start_login_timeout_watchdog()
             else:
                 logger.warning("market login missing connect params front=%s broker_id=%s user_name=%s", login_req.front, login_req.broker_id, login_req.user_name)
                 return False
         except Exception as exc:
+            self._cancel_login_timeout_watchdog()
             self._pending_login_conn_id = None
             self._pending_login_request_id = None
             self.state_machine.transition_to(MarketState.INIT)
@@ -148,6 +152,29 @@ class MarketEngine:
         await self.bus.publish(Event(type="market.quote.update", source="market", payload={"quote": quote}, tags={"symbol": quote.symbol}))
         await self.ws.broadcast(self._serialize_quote_message(quote))
 
+    def _start_login_timeout_watchdog(self) -> None:
+        self._cancel_login_timeout_watchdog()
+        self._login_timeout_task = asyncio.create_task(self._login_timeout_after(10.0), name="market-login-timeout")
+
+    def _cancel_login_timeout_watchdog(self) -> None:
+        if self._login_timeout_task is not None:
+            self._login_timeout_task.cancel()
+            self._login_timeout_task = None
+
+    async def _login_timeout_after(self, timeout_seconds: float) -> None:
+        try:
+            await asyncio.sleep(timeout_seconds)
+            if self.state_machine.get_state() == MarketState.LOGGING_IN:
+                conn_id = self._pending_login_conn_id or 0
+                request_id = self._pending_login_request_id or self._pending_login_requests.get(conn_id, 0)
+                logger.warning("market login timeout after %.1fs conn_id=%s request_id=%s", timeout_seconds, conn_id, request_id)
+                self.state_machine.transition_to(MarketState.INIT)
+                await self._send_market_response(conn_id, "market_login", request_id, False, "login timeout", {"status": "timeout", "timeout_seconds": timeout_seconds}, code=504)
+                self._pending_login_conn_id = None
+                self._pending_login_request_id = None
+        except asyncio.CancelledError:
+            return
+
     async def _restore_subscriptions(self) -> None:
         if self._subscriptions:
             logger.info("market restoring subscriptions=%s", sorted(self._subscriptions))
@@ -194,12 +221,14 @@ class MarketEngine:
                         self._pending_login_request_id = None
                     if ok:
                         logger.info("market login rsp success reqid=%s conn_id=%s", reqid, conn_id)
+                        self._cancel_login_timeout_watchdog()
                         self.state_machine.transition_to(MarketState.READY)
                         await self._send_market_response(conn_id, "market_login", reqid, True, "login success", {"status": "ready"})
                         await self._restore_subscriptions()
                         await self._restore_client_subscriptions(conn_id)
                     else:
                         logger.warning("market login rsp error=%s", error)
+                        self._cancel_login_timeout_watchdog()
                         self.state_machine.transition_to(MarketState.INIT)
                         await self._send_market_response(conn_id, "market_login", reqid, False, str(error.get("ErrorMsg", "login failed")), {"error": error}, code=int(error.get("ErrorID", 500)) or 500)
                     self._pending_login_conn_id = None
@@ -259,9 +288,11 @@ class MarketEngine:
         matched = False
         for conn_id, symbols in self._conn_subscriptions.items():
             if quote.symbol in symbols:
+                logger.info("market pushing quote conn_id=%s symbol=%s", conn_id, quote.symbol)
                 await self.ws.send_to(conn_id, message)
                 matched = True
         if not matched and not self._conn_subscriptions:
+            logger.info("market broadcasting quote symbol=%s", quote.symbol)
             await self.ws.broadcast(message)
 
     def attach_client_subscription(self, conn_id: int, symbols: list[str]) -> None:
@@ -304,7 +335,15 @@ class MarketEngine:
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
-        return symbol.strip().upper()
+        symbol = symbol.strip()
+        if "." not in symbol:
+            return symbol.lower() if symbol[:2].isalpha() else symbol
+        exchange_id, instrument_id = symbol.split(".", 1)
+        exchange_id = exchange_id.strip().upper()
+        instrument_id = instrument_id.strip()
+        if exchange_id == "SHFE":
+            instrument_id = instrument_id.lower()
+        return f"{exchange_id}.{instrument_id}"
 
     @staticmethod
     def _serialize_quote_message(quote: Quote) -> str:
