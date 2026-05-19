@@ -4,7 +4,6 @@ import asyncio
 from pathlib import Path
 
 from pyctp.gateway.config.loader import load_config
-from pyctp.gateway.config.models import AppConfig
 from pyctp.gateway.eventbus.bus import EventBus
 from pyctp.gateway.market.adapter import MarketFeedAdapter, PybindMdApiAdapter
 from pyctp.gateway.market.engine import MarketConfig, MarketEngine
