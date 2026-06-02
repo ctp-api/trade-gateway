@@ -198,3 +198,63 @@ broker 列表推送：[`protocol.BuildBrokerListMsg`](pkg/protocol/json.go)
 - 示例客户端：
   - 交互式 Python 客户端：[examples/python_client.py](examples/python_client.py)
   - 最简示例：[examples/simple_example.py](examples/simple_example.py)
+
+
+
+- Implement `pyctp/gateway/protocol/` data models, enums, and JSON/message builders to match Go `pkg/protocol`
+- Complete `pyctp/gateway/protocol/types.py` with full enums and core data models aligned to Go `pkg/protocol`
+- Extend `pyctp/gateway/protocol/json.py` with builders/parsers for notify and rtn_data messages
+- Implement unified config loading in `pyctp/gateway/config.py` matching Go `pkg/config`
+- Implement structured logging wrapper in `pyctp/gateway/logger.py` matching Go `pkg/logger`
+- Align `pyctp/gateway/market/` with Go `pkg/marketfeed` interface, cache, and reconnect behavior
+- Verify and harden `pyctp/gateway/websocket/` conn_id, routing, and broadcast semantics
+- Implement `pyctp/gateway/trader/` state machine, login flow, query flow, and order lifecycle
+- Implement `pyctp/gateway/condorder/` data model, storage, validation, and trigger flow
+
+
+
+- 实现 `pyctp/gateway/protocol/` 下的数据模型、枚举类型以及 JSON/消息构建器，使其与 Go 语言版本的 `pkg/protocol` 保持一致。
+- 完善 `pyctp/gateway/protocol/types.py`，补充完整的枚举类型及核心数据模型，使其与 Go 语言版本的 `pkg/protocol` 对齐。
+- 扩展 `pyctp/gateway/protocol/json.py`，增加用于处理通知（notify）及回报数据（rtn_data）消息的构建器与解析器。
+- 在 `pyctp/gateway/config.py` 中实现统一的配置加载机制，使其与 Go 语言版本的 `pkg/config` 保持一致。
+- 在 `pyctp/gateway/logger.py` 中实现结构化日志封装层，使其与 Go 语言版本的 `pkg/logger` 保持一致。
+- 将 `pyctp/gateway/market/` 模块与 Go 语言版本的 `pkg/marketfeed` 在接口定义、缓存机制及重连行为上进行对齐。
+- 验证并强化 `pyctp/gateway/websocket/` 模块中的连接 ID（conn_id）管理、消息路由及广播机制的逻辑与健壮性。
+- 在 `pyctp/gateway/trader/` 模块中实现状态机、登录流程、查询流程以及订单生命周期管理。
+- 在 `pyctp/gateway/condorder/` 模块中实现条件单的数据模型、存储机制、有效性校验及触发流程。
+
+
+
+Implement `pyctp/gateway/protocol/` data models, enums, and JSON/message builders to match Go `pkg/protocol`
+
+Add unified Python config and structured logger layers to match Go `pkg/config` and `pkg/logger`
+
+Create a unified Python market client abstraction with cache/state APIs to match Go `pkg/marketfeed`
+
+Implement trader state machine, login flow, settlement flow, and query scheduler core in Python to match Go `pkg/trader`
+
+Stabilize Python WebSocket connection management, `conn_id`, and routing semantics to match Go `pkg/websocket`
+
+Add order-key persistence and reconnect recovery for Python trader to match Go `pkg/trader/persistence.go`
+
+Implement Python order/cancel/query/transfer/password-change handlers to match Go `pkg/trader/order.go`, `query.go`, `misc.go`, `transfer.go`
+
+Build Python condition-order subsystem: models, validator, checker, storage, index, and manager to match Go `pkg/condorder`
+
+
+
+实现 `pyctp/gateway/protocol/` 下的数据模型、枚举类型以及 JSON/消息构建器，以对标 Go 语言的 `pkg/protocol` 模块。
+
+添加统一的 Python 配置层和结构化日志层，以对标 Go 语言的 `pkg/config` 和 `pkg/logger` 模块。
+
+创建统一的 Python 行情客户端抽象层，并提供缓存与状态管理 API，以对标 Go 语言的 `pkg/marketfeed` 模块。
+
+使用 Python 实现交易员状态机、登录流程、结算流程以及查询调度核心，以对标 Go 语言的 `pkg/trader` 模块。
+
+稳定化 Python WebSocket 连接管理机制、`conn_id` 标识符以及路由语义，以对标 Go 语言的 `pkg/websocket` 模块。
+
+为 Python 交易员模块添加订单键（order-key）持久化存储及重连恢复功能，以对标 Go 语言的 `pkg/trader/persistence.go` 文件。
+
+实现 Python 端的报单、撤单、查询、资金划转及密码修改等业务处理器，以对标 Go 语言的 `pkg/trader/order.go`、`query.go`、`misc.go` 和 `transfer.go` 文件。
+
+构建 Python 条件单子系统：包含数据模型、校验器、检查器、存储模块、索引模块及管理器，以对标 Go 语言的 `pkg/condorder` 模块。
