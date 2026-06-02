@@ -16,6 +16,7 @@ from pyctp.gateway.protocol.types import (
     WsRequest,
     WsResponse,
 )
+from pyctp.gateway.trader.notify import TraderNotify, TraderNotifyType
 from pyctp.gateway.trader.persistence import TraderPersistence, TraderPersistenceData
 from pyctp.gateway.websocket import WebSocketServer
 
@@ -33,6 +34,22 @@ class TraderState(str, Enum):
     READY = "ready"
     STOPPING = "stopping"
     STOPPED = "stopped"
+
+
+TRADER_STATE_TRANSITIONS: dict[TraderState, set[TraderState]] = {
+    TraderState.INIT: {TraderState.CONNECTING, TraderState.STOPPING},
+    TraderState.CONNECTING: {TraderState.CONNECTED, TraderState.READY, TraderState.STOPPING, TraderState.INIT},
+    TraderState.CONNECTED: {TraderState.AUTHENTICATING, TraderState.READY, TraderState.STOPPING},
+    TraderState.AUTHENTICATING: {TraderState.AUTHENTICATED, TraderState.READY, TraderState.STOPPING},
+    TraderState.AUTHENTICATED: {TraderState.LOGGING_IN, TraderState.READY, TraderState.STOPPING},
+    TraderState.LOGGING_IN: {TraderState.LOGGED_IN, TraderState.READY, TraderState.STOPPING},
+    TraderState.LOGGED_IN: {TraderState.SETTLEMENT_QUERYING, TraderState.READY, TraderState.STOPPING},
+    TraderState.SETTLEMENT_QUERYING: {TraderState.CONFIRMING_SETTLEMENT, TraderState.READY, TraderState.STOPPING},
+    TraderState.CONFIRMING_SETTLEMENT: {TraderState.READY, TraderState.STOPPING},
+    TraderState.READY: {TraderState.CONNECTING, TraderState.STOPPING},
+    TraderState.STOPPING: {TraderState.STOPPED},
+    TraderState.STOPPED: {TraderState.INIT},
+}
 
 
 @dataclass(slots=True)
@@ -63,6 +80,10 @@ class TraderEngine:
         self._query_pending: dict[str, dict[str, Any]] = {}
         self._query_results: dict[str, list[dict[str, Any]]] = {}
         self._persistence = TraderPersistence(config.data_dir)
+        self._last_trading_day: str = ""
+        self._last_account_snapshot: dict[str, Any] = {}
+        self._last_position_snapshot: dict[str, int] = {}
+        self._last_trade_snapshot: dict[str, dict[str, Any]] = {}
         self._query_results: dict[str, list[dict[str, Any]]] = {
             "account": [],
             "position": [],
@@ -78,44 +99,58 @@ class TraderEngine:
 
     def _set_state(self, state: TraderState) -> None:
         previous = self.state
+        allowed = TRADER_STATE_TRANSITIONS.get(previous, set())
+        if previous != state and allowed and state not in allowed:
+            if state == TraderState.INIT and previous == TraderState.STOPPED:
+                self.state = state
+                self._queue_system_notify(f"state changed: {previous.value} -> {state.value}", msg_type=TraderNotifyType.STATE, data={"from": previous.value, "to": state.value})
+                return
+            self._notify_error("invalid state transition", category=TraderNotifyType.ERROR_SYSTEM, data={"from": previous.value, "to": state.value})
+            return
         self.state = state
         if previous != state and previous != TraderState.INIT:
-            self._queue_system_notify(f"state changed: {previous.value} -> {state.value}", msg_type="STATE", data={"from": previous.value, "to": state.value})
+            self._queue_system_notify(f"state changed: {previous.value} -> {state.value}", msg_type=TraderNotifyType.STATE, data={"from": previous.value, "to": state.value})
             if previous == TraderState.READY and state == TraderState.CONNECTING:
-                self._notify_trading_day_change(self._get_trading_day(), self._get_trading_day(), meta={"reason": "reconnect"})
+                current_day = self._get_trading_day()
+                self._notify_trading_day_change(self._last_trading_day, current_day, meta={"reason": "reconnect"})
+                self._last_trading_day = current_day
 
-    def _notify_error(self, msg: str, code: int = 500, category: str = "SYSTEM", data: dict[str, Any] | None = None) -> None:
-        self._queue_system_notify(msg, code=code, level="ERROR", msg_type=f"ERROR.{category}", data=data)
+    @staticmethod
+    def _notify_type_value(kind: TraderNotifyType | str) -> str:
+        return kind.value if isinstance(kind, TraderNotifyType) else str(kind)
+
+    def _notify_error(self, msg: str, code: int = 500, category: TraderNotifyType | str = TraderNotifyType.ERROR_SYSTEM, data: dict[str, Any] | None = None) -> None:
+        self._queue_system_notify(msg, code=code, level="ERROR", msg_type=self._notify_type_value(category), data=data)
 
     def _notify_query_complete(self, kind: str, count: int, ok: bool = True, error: str = "") -> None:
         payload = {"kind": kind, "count": count, "ok": ok}
         if error:
             payload["error"] = error
-        self._queue_system_notify(f"query complete: {kind} count={count}", level="INFO" if ok else "ERROR", msg_type="QUERY", data=payload)
+        self._queue_system_notify(f"query complete: {kind} count={count}", level="INFO" if ok else "ERROR", msg_type=self._notify_type_value(TraderNotifyType.QUERY), data=payload)
 
     def _notify_account_change(self, kind: str, before: float, after: float, meta: dict[str, Any] | None = None) -> None:
         payload = {"kind": kind, "before": before, "after": after, "delta": after - before}
         if meta:
             payload.update(meta)
-        self._queue_system_notify(f"account change: {kind} {before} -> {after}", msg_type="ACCOUNT", data=payload)
+        self._queue_system_notify(f"account change: {kind} {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.ACCOUNT), data=payload)
 
     def _notify_position_change(self, instrument_id: str, before: int, after: int, meta: dict[str, Any] | None = None) -> None:
         payload = {"instrument_id": instrument_id, "before": before, "after": after, "delta": after - before}
         if meta:
             payload.update(meta)
-        self._queue_system_notify(f"position change: {instrument_id} {before} -> {after}", msg_type="POSITION", data=payload)
+        self._queue_system_notify(f"position change: {instrument_id} {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.POSITION), data=payload)
 
     def _notify_order_status_change(self, order_ref: str, before: str, after: str, meta: dict[str, Any] | None = None) -> None:
         payload = {"order_ref": order_ref, "before": before, "after": after}
         if meta:
             payload.update(meta)
-        self._queue_system_notify(f"order status change: {order_ref} {before} -> {after}", msg_type="ORDER", data=payload)
+        self._queue_system_notify(f"order status change: {order_ref} {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.ORDER), data=payload)
 
     def _notify_trading_day_change(self, before: str, after: str, meta: dict[str, Any] | None = None) -> None:
         payload = {"before": before, "after": after}
         if meta:
             payload.update(meta)
-        self._queue_system_notify(f"trading day changed: {before} -> {after}", msg_type="TRADING_DAY", data=payload)
+        self._queue_system_notify(f"trading day changed: {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.TRADING_DAY), data=payload)
 
     def is_ready(self) -> bool:
         return self.state == TraderState.READY
@@ -147,6 +182,10 @@ class TraderEngine:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._pending_login_conn_id = None
+        self._login_request = None
+        self._query_pending.clear()
+        self._order_conn_map.clear()
         await self.ws.stop()
         self._set_state(TraderState.STOPPED)
 
@@ -198,6 +237,10 @@ class TraderEngine:
             if resp.request_id is None:
                 resp.request_id = req.request_id
             await self.ws.send_to(conn_id, self.codec.build_response(resp))
+            return
+
+        if event.type == "ctp.front_disconnected":
+            await self._on_front_disconnected(event)
             return
 
         if event.type == "ctp.rsp_authenticate":
@@ -310,19 +353,30 @@ class TraderEngine:
     def _mk_response(self, aid: str, req: WsRequest, ok: bool, code: int, msg: str, data: dict[str, Any] | None = None, request_id: int | None = None) -> WsResponse:
         return WsResponse(aid=aid, ok=ok, code=code, msg=msg, data=data or {}, conn_id=req.conn_id, request_id=request_id if request_id is not None else req.request_id)
 
-    def _build_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> str:
-        payload = self.codec.build_notify(code=code, msg=msg, level=level, msg_type=msg_type)
-        if data:
-            return self.codec.dumps({"aid": "notify", "code": code, "msg": msg, "level": level, "msg_type": msg_type, "data": data})
-        return payload
+    def _build_notify_payload(self, msg: str, code: int = 0, level: str = "INFO", msg_type: TraderNotifyType | str = TraderNotifyType.NOTIFY, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        return TraderNotify.build_payload(msg, msg_type, code=code, level=level, data=data)
 
-    def _queue_system_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
-        self._system_notify_queue.append({"msg": msg, "code": code, "level": level, "msg_type": msg_type, "data": data})
+    def _build_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: TraderNotifyType | str = TraderNotifyType.NOTIFY, data: dict[str, Any] | None = None) -> str:
+        return self.codec.dumps(self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
+
+    def _queue_system_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: TraderNotifyType | str = TraderNotifyType.NOTIFY, data: dict[str, Any] | None = None) -> None:
+        self._system_notify_queue.append(self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
 
     async def _drain_system_notify_queue(self) -> None:
         while self._system_notify_queue:
             item = self._system_notify_queue.pop(0)
-            await self._broadcast_notify(item["msg"], code=int(item["code"]), level=str(item["level"]), msg_type=str(item["msg_type"]), data=item.get("data"))
+            await self._broadcast_notify_payload(item)
+
+    async def _broadcast_notify_payload(self, payload: dict[str, Any]) -> None:
+        await self.ws.broadcast(self.codec.dumps(payload))
+
+    async def _send_notify_payload(self, conn_id: int, payload: dict[str, Any]) -> None:
+        if conn_id:
+            await self.ws.send_to(conn_id, self.codec.dumps(payload))
+
+    async def _notify_query_complete_event(self, kind: str, rows: list[dict[str, Any]], ok: bool = True, error: str = "") -> None:
+        self._notify_query_complete(kind, len(rows), ok=ok, error=error)
+        await self._drain_system_notify_queue()
 
     async def _notify_query_complete_event(self, kind: str, rows: list[dict[str, Any]], ok: bool = True, error: str = "") -> None:
         self._notify_query_complete(kind, len(rows), ok=ok, error=error)
@@ -336,12 +390,28 @@ class TraderEngine:
         self._notify_position_change(instrument_id, before, after, meta=meta)
         await self._drain_system_notify_queue()
 
+    def _notify_trade_summary(self, order_ref: str, instrument_id: str, total_volume: int, total_amount: float, trade_count: int, meta: dict[str, Any] | None = None) -> None:
+        payload = {
+            "order_ref": order_ref,
+            "instrument_id": instrument_id,
+            "total_volume": total_volume,
+            "total_amount": total_amount,
+            "trade_count": trade_count,
+        }
+        if meta:
+            payload.update(meta)
+        self._queue_system_notify(
+            f"trade summary: {order_ref or instrument_id} volume={total_volume} trades={trade_count}",
+            msg_type=self._notify_type_value(TraderNotifyType.TRADE_SUMMARY),
+            data=payload,
+        )
+
     async def _send_notify(self, conn_id: int, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
         if conn_id:
-            await self.ws.send_to(conn_id, self._build_notify(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
+            await self._send_notify_payload(conn_id, self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
 
     async def _broadcast_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
-        await self.ws.broadcast(self._build_notify(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
+        await self._broadcast_notify_payload(self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
 
     async def dispatch_request(self, req: WsRequest) -> WsResponse:
         if req.aid == "req_login":
@@ -398,7 +468,15 @@ class TraderEngine:
 
         return self._mk_response(req.aid, req, True, 0, "login request accepted", {"user_name": login.user_name, "broker_id": login.broker_id, "front": login.front, "appid": login.appid, "auth_code": login.auth_code, "status": self.state.value})
 
+    def _can_accept_query(self) -> bool:
+        return self.state in {TraderState.READY, TraderState.LOGGED_IN, TraderState.SETTLEMENT_QUERYING, TraderState.CONFIRMING_SETTLEMENT}
+
+    def _can_accept_order(self) -> bool:
+        return self.state in {TraderState.READY, TraderState.LOGGED_IN}
+
     async def handle_query_trading_account(self, req: WsRequest) -> WsResponse:
+        if not self._can_accept_query():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for query: {self.state.value}")
         try:
             self.ctp.clear_query_rows("account")
             request_id = self._next_request_id()
@@ -410,6 +488,8 @@ class TraderEngine:
         return self._mk_response(req.aid, req, True, 0, "query trading account accepted", {"status": "pending"}, request_id=request_id)
 
     async def handle_query_investor_position(self, req: WsRequest) -> WsResponse:
+        if not self._can_accept_query():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for query: {self.state.value}")
         try:
             self.ctp.clear_query_rows("position")
             request_id = self._next_request_id()
@@ -421,6 +501,8 @@ class TraderEngine:
         return self._mk_response(req.aid, req, True, 0, "query investor position accepted", {"status": "pending"}, request_id=request_id)
 
     async def handle_query_order(self, req: WsRequest) -> WsResponse:
+        if not self._can_accept_query():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for query: {self.state.value}")
         try:
             self.ctp.clear_query_rows("order")
             request_id = self._next_request_id()
@@ -432,6 +514,8 @@ class TraderEngine:
         return self._mk_response(req.aid, req, True, 0, "query order accepted", {"status": "pending"}, request_id=request_id)
 
     async def handle_query_trade(self, req: WsRequest) -> WsResponse:
+        if not self._can_accept_query():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for query: {self.state.value}")
         try:
             self.ctp.clear_query_rows("trade")
             request_id = self._next_request_id()
@@ -443,6 +527,8 @@ class TraderEngine:
         return self._mk_response(req.aid, req, True, 0, "query trade accepted", {"status": "pending"}, request_id=request_id)
 
     async def handle_query_instrument(self, req: WsRequest) -> WsResponse:
+        if not self._can_accept_query():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for query: {self.state.value}")
         payload = self._extract_payload(req)
         instrument_id = str(payload.get("instrument_id", ""))
         try:
@@ -454,6 +540,15 @@ class TraderEngine:
             self._query_pending.pop("instrument", None)
             return self._mk_response(req.aid, req, False, 500, f"ctp query instrument failed: {exc}", request_id=request_id if 'request_id' in locals() else None)
         return self._mk_response(req.aid, req, True, 0, "query instrument accepted", {"status": "pending", "instrument_id": instrument_id}, request_id=request_id)
+
+    async def _on_front_disconnected(self, event: Event) -> None:
+        self._pending_login_conn_id = None
+        self._login_request = None
+        self._query_pending.clear()
+        self._queue_system_notify("front disconnected", msg_type=TraderNotifyType.ERROR_SYSTEM, level="ERROR", data={"reason": event.payload.get("reason", 0)})
+        if self.state not in {TraderState.STOPPING, TraderState.STOPPED}:
+            self._set_state(TraderState.READY)
+            self._set_state(TraderState.INIT)
 
     async def _on_rsp_authenticate(self, event: Event) -> None:
         payload = event.payload
@@ -480,11 +575,15 @@ class TraderEngine:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
             self._login_request = None
+            self._notify_error("login failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SYSTEM, data={"data": data, "error": error})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self._set_state(TraderState.LOGGED_IN)
+        self._queue_system_notify("user logged in", msg_type=TraderNotifyType.STATE, data={"stage": "logged_in"})
         self._set_state(TraderState.SETTLEMENT_QUERYING)
+        self._queue_system_notify("settlement querying started", msg_type=TraderNotifyType.SETTLEMENT, data={"stage": "querying"})
         self._set_state(TraderState.CONFIRMING_SETTLEMENT)
+        self._queue_system_notify("settlement confirming started", msg_type=TraderNotifyType.SETTLEMENT, data={"stage": "confirming"})
         await self._send_notify(conn_id, "login success, confirming settlement...")
 
     async def _on_rsp_settlement_info_confirm(self, event: Event) -> None:
@@ -496,12 +595,14 @@ class TraderEngine:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
             self._login_request = None
-            await self._send_notify(conn_id, f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", code=int(error.get("ErrorID", 500) or 500), level="ERROR", msg_type="SETTLEMENT", data={"data": data, "error": error})
+            self._notify_error("settlement confirm failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SETTLEMENT, data={"data": data, "error": error})
+            await self._send_notify(conn_id, f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", code=int(error.get("ErrorID", 500) or 500), level="ERROR", msg_type=TraderNotifyType.SETTLEMENT, data={"data": data, "error": error})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self._set_state(TraderState.READY)
+        self._queue_system_notify("settlement confirmed", msg_type=TraderNotifyType.SETTLEMENT, data={"status": "confirmed"})
         if conn_id:
-            await self._send_notify(conn_id, "login success", msg_type="SETTLEMENT", data={"status": "ready"})
+            await self._send_notify(conn_id, "login success", msg_type=TraderNotifyType.SETTLEMENT, data={"status": "ready"})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=event.request_id)))
         self._pending_login_conn_id = None
         self._login_request = None
@@ -545,14 +646,43 @@ class TraderEngine:
             after = float(rows[0].get("balance", 0.0) or 0.0)
             if before != after:
                 await self._notify_balance_change_event(before, after, meta={"kind": "account.balance"})
+            self._last_account_snapshot = {"balance": after, "available": float(rows[0].get("available", 0.0) or 0.0), "trading_day": str(rows[0].get("trading_day", ""))}
+        elif kind == "account" and rows:
+            self._last_account_snapshot = {"balance": float(rows[0].get("balance", 0.0) or 0.0), "available": float(rows[0].get("available", 0.0) or 0.0), "trading_day": str(rows[0].get("trading_day", ""))}
         if kind == "position" and previous_rows and rows:
             prev_map = {str(item.get("instrument_id", "")): int(item.get("position", 0) or 0) for item in previous_rows}
+            current_map: dict[str, int] = {}
             for item in rows:
                 instrument_id = str(item.get("instrument_id", ""))
                 before = int(prev_map.get(instrument_id, 0))
                 after = int(item.get("position", 0) or 0)
+                current_map[instrument_id] = after
                 if before != after:
                     await self._notify_position_change_event(instrument_id, before, after, meta={"kind": "position.update"})
+            self._last_position_snapshot = current_map
+        elif kind == "position" and rows:
+            self._last_position_snapshot = {str(item.get("instrument_id", "")): int(item.get("position", 0) or 0) for item in rows}
+        if kind == "trade" and rows:
+            total_volume = 0
+            total_amount = 0.0
+            trade_count = len(rows)
+            order_ref = ""
+            instrument_id = ""
+            for item in rows:
+                total_volume += int(item.get("volume", 0) or 0)
+                total_amount += float(item.get("price", 0.0) or 0.0) * int(item.get("volume", 0) or 0)
+                order_ref = order_ref or str(item.get("order_ref", ""))
+                instrument_id = instrument_id or str(item.get("instrument_id", ""))
+            key = order_ref or instrument_id
+            previous_summary = self._last_trade_snapshot.get(key, {})
+            if previous_summary.get("total_volume") != total_volume or previous_summary.get("trade_count") != trade_count:
+                self._notify_trade_summary(order_ref, instrument_id, total_volume, total_amount, trade_count, meta={"kind": "trade.query"})
+            self._last_trade_snapshot[key] = {"total_volume": total_volume, "total_amount": total_amount, "trade_count": trade_count}
+        if kind == "account" and rows:
+            current_day = str(rows[0].get("trading_day", ""))
+            if self._last_trading_day and current_day and self._last_trading_day != current_day:
+                self._notify_trading_day_change(self._last_trading_day, current_day, meta={"kind": "account.query"})
+            self._last_trading_day = current_day or self._last_trading_day
         self._query_pending.pop(kind, None)
 
     async def _on_rsp_order_insert(self, event: Event) -> None:
@@ -599,6 +729,10 @@ class TraderEngine:
         data = event.payload.get("data", {}) or {}
         order_ref = str(data.get("OrderRef", ""))
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
+        after_status = str(data.get("OrderStatus", "") or "")
+        if order_ref and before_status != after_status:
+            self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rtn_order"})
         await self.ws.broadcast(self.codec.dumps({"aid": "rtn_order", "ok": True, "data": data}))
         if conn_id:
             await self._send_notify(conn_id, "rtn_order received", msg_type="ORDER")
@@ -607,6 +741,8 @@ class TraderEngine:
         data = event.payload.get("data", {}) or {}
         order_ref = str(data.get("OrderRef", ""))
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if order_ref:
+            self._notify_order_status_change(order_ref, "", "part_traded", meta={"event": "rtn_trade"})
         await self.ws.broadcast(self.codec.dumps({"aid": "rtn_trade", "ok": True, "data": data}))
         if conn_id:
             await self._send_notify(conn_id, "rtn_trade received", msg_type="TRADE")
@@ -782,6 +918,8 @@ class TraderEngine:
         return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=req.request_id)
 
     async def handle_insert_order(self, req: WsRequest, order: InsertOrderRequest) -> WsResponse:
+        if not self._can_accept_order():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for order: {self.state.value}")
         symbol = self._build_symbol(order.exchange_id, order.instrument_id)
         direction = self._map_direction_from_request(order.direction, order.offset)
         if direction is None:
@@ -789,6 +927,7 @@ class TraderEngine:
         try:
             order_ref = self.ctp.send_order(symbol, direction, order.price, order.volume)
         except Exception as exc:
+            self._notify_error("send order failed", category=TraderNotifyType.ERROR_ORDER, data={"symbol": symbol, "direction": direction, "error": str(exc)})
             return self._mk_response(req.aid, req, False, 500, f"ctp send order failed: {exc}")
         if order_ref:
             self._order_conn_map[order_ref] = req.conn_id or 0
@@ -802,11 +941,14 @@ class TraderEngine:
         })
 
     async def handle_cancel_order(self, req: WsRequest, cancel: CancelOrderRequest) -> WsResponse:
+        if not self._can_accept_order():
+            return self._mk_response(req.aid, req, False, 409, f"trader not ready for order: {self.state.value}")
         if not cancel.order_id:
             return self._mk_response(req.aid, req, False, 400, "missing order_id")
         try:
             self.ctp.cancel_order(cancel.order_id, cancel.exchange_id, cancel.instrument_id)
         except Exception as exc:
+            self._notify_error("cancel order failed", category=TraderNotifyType.ERROR_ORDER, data={"order_id": cancel.order_id, "error": str(exc)})
             return self._mk_response(req.aid, req, False, 500, f"ctp cancel order failed: {exc}")
         if req.conn_id is not None:
             self._order_conn_map.setdefault(cancel.order_id, req.conn_id)
