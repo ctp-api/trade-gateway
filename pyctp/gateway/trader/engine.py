@@ -153,6 +153,17 @@ class TraderEngine:
             payload.update(meta)
         self._queue_system_notify(f"trading day changed: {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.TRADING_DAY), data=payload)
 
+    def _login_session_active(self, conn_id: int | None = None, session_id: int | None = None) -> bool:
+        if self._pending_login_conn_id is None or self._pending_login_session_id is None:
+            return False
+        if conn_id is not None and conn_id != self._pending_login_conn_id:
+            return False
+        if session_id is not None and session_id != self._pending_login_session_id:
+            return False
+        if self.state in {TraderState.STOPPING, TraderState.STOPPED, TraderState.INIT}:
+            return False
+        return True
+
     def is_ready(self) -> bool:
         return self.state == TraderState.READY
 
@@ -527,6 +538,8 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         data = payload.get("data", {}) or {}
         conn_id = self._pending_login_conn_id or 0
+        if not self._login_session_active(conn_id=conn_id):
+            return
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
@@ -544,6 +557,8 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         data = payload.get("data", {}) or {}
         conn_id = self._pending_login_conn_id or 0
+        if not self._login_session_active(conn_id=conn_id):
+            return
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
