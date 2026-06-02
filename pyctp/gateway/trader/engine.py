@@ -81,6 +81,8 @@ class TraderEngine:
         self.state = state
         if previous != state and previous != TraderState.INIT:
             self._queue_system_notify(f"state changed: {previous.value} -> {state.value}", msg_type="STATE", data={"from": previous.value, "to": state.value})
+            if previous == TraderState.READY and state == TraderState.CONNECTING:
+                self._notify_trading_day_change(self._get_trading_day(), self._get_trading_day(), meta={"reason": "reconnect"})
 
     def _notify_error(self, msg: str, code: int = 500, category: str = "SYSTEM", data: dict[str, Any] | None = None) -> None:
         self._queue_system_notify(msg, code=code, level="ERROR", msg_type=f"ERROR.{category}", data=data)
@@ -102,6 +104,18 @@ class TraderEngine:
         if meta:
             payload.update(meta)
         self._queue_system_notify(f"position change: {instrument_id} {before} -> {after}", msg_type="POSITION", data=payload)
+
+    def _notify_order_status_change(self, order_ref: str, before: str, after: str, meta: dict[str, Any] | None = None) -> None:
+        payload = {"order_ref": order_ref, "before": before, "after": after}
+        if meta:
+            payload.update(meta)
+        self._queue_system_notify(f"order status change: {order_ref} {before} -> {after}", msg_type="ORDER", data=payload)
+
+    def _notify_trading_day_change(self, before: str, after: str, meta: dict[str, Any] | None = None) -> None:
+        payload = {"before": before, "after": after}
+        if meta:
+            payload.update(meta)
+        self._queue_system_notify(f"trading day changed: {before} -> {after}", msg_type="TRADING_DAY", data=payload)
 
     def is_ready(self) -> bool:
         return self.state == TraderState.READY
@@ -243,6 +257,26 @@ class TraderEngine:
             self._notify_error("query instrument failed", category="QUERY", data=event.payload)
             return
 
+        if event.type == "ctp.rsp_qry_trading_account_error":
+            self._notify_error("query trading account failed", category="QUERY", data=event.payload)
+            return
+
+        if event.type == "ctp.rsp_qry_investor_position_error":
+            self._notify_error("query investor position failed", category="QUERY", data=event.payload)
+            return
+
+        if event.type == "ctp.rsp_qry_order_error":
+            self._notify_error("query order failed", category="QUERY", data=event.payload)
+            return
+
+        if event.type == "ctp.rsp_qry_trade_error":
+            self._notify_error("query trade failed", category="QUERY", data=event.payload)
+            return
+
+        if event.type == "ctp.rsp_qry_instrument_error":
+            self._notify_error("query instrument failed", category="QUERY", data=event.payload)
+            return
+
         if event.type == "ctp.rsp_settlement_info_confirm":
             await self._broadcast_notify("settlement info confirmed", msg_type="SETTLEMENT")
             return
@@ -289,6 +323,18 @@ class TraderEngine:
         while self._system_notify_queue:
             item = self._system_notify_queue.pop(0)
             await self._broadcast_notify(item["msg"], code=int(item["code"]), level=str(item["level"]), msg_type=str(item["msg_type"]), data=item.get("data"))
+
+    async def _notify_query_complete_event(self, kind: str, rows: list[dict[str, Any]], ok: bool = True, error: str = "") -> None:
+        self._notify_query_complete(kind, len(rows), ok=ok, error=error)
+        await self._drain_system_notify_queue()
+
+    async def _notify_balance_change_event(self, before: float, after: float, meta: dict[str, Any] | None = None) -> None:
+        self._notify_account_change("balance", before, after, meta=meta)
+        await self._drain_system_notify_queue()
+
+    async def _notify_position_change_event(self, instrument_id: str, before: int, after: int, meta: dict[str, Any] | None = None) -> None:
+        self._notify_position_change(instrument_id, before, after, meta=meta)
+        await self._drain_system_notify_queue()
 
     async def _send_notify(self, conn_id: int, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
         if conn_id:
@@ -473,6 +519,7 @@ class TraderEngine:
             return
         conn_id = int(pending.get("conn_id") or self._pending_login_conn_id or 0)
         rows = self._normalize_query_rows(kind, list(pending.get("rows", [])))
+        previous_rows = list(self._query_results.get(kind, []))
         self._query_results[kind] = rows
         response_kind = {
             "account": "query_account",
@@ -492,6 +539,20 @@ class TraderEngine:
         )
         if conn_id:
             await self.ws.send_to(conn_id, self.codec.build_response(response))
+        await self._notify_query_complete_event(kind, rows, ok=int(error.get("ErrorID", 0)) == 0, error=str(error.get("ErrorMsg", "")))
+        if kind == "account" and previous_rows and rows:
+            before = float(previous_rows[0].get("balance", 0.0) or 0.0)
+            after = float(rows[0].get("balance", 0.0) or 0.0)
+            if before != after:
+                await self._notify_balance_change_event(before, after, meta={"kind": "account.balance"})
+        if kind == "position" and previous_rows and rows:
+            prev_map = {str(item.get("instrument_id", "")): int(item.get("position", 0) or 0) for item in previous_rows}
+            for item in rows:
+                instrument_id = str(item.get("instrument_id", ""))
+                before = int(prev_map.get(instrument_id, 0))
+                after = int(item.get("position", 0) or 0)
+                if before != after:
+                    await self._notify_position_change_event(instrument_id, before, after, meta={"kind": "position.update"})
         self._query_pending.pop(kind, None)
 
     async def _on_rsp_order_insert(self, event: Event) -> None:
@@ -500,9 +561,14 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
         if int(error.get("ErrorID", 0)) != 0:
             await self._send_order_error(conn_id, "rsp_order_insert", order_ref, data, error)
+            self._notify_error("order insert rejected", category="ORDER", data={"order_ref": order_ref, "data": data, "error": error})
             return
+        after_status = str(data.get("OrderStatus", "insert_submitted") or "insert_submitted")
+        if order_ref and before_status != after_status:
+            self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rsp_order_insert"})
         await self._push_order_event(conn_id, "rsp_order_insert", data)
 
     async def _on_err_rtn_order_insert(self, event: Event) -> None:
@@ -519,9 +585,14 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
         if int(error.get("ErrorID", 0)) != 0:
             await self._send_order_error(conn_id, "rsp_order_action", order_ref, data, error)
+            self._notify_error("order action rejected", category="ORDER", data={"order_ref": order_ref, "data": data, "error": error})
             return
+        after_status = str(data.get("OrderStatus", "cancel_submitted") or "cancel_submitted")
+        if order_ref and before_status != after_status:
+            self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rsp_order_action"})
         await self._push_order_event(conn_id, "rsp_order_action", data)
 
     async def _on_rtn_order(self, event: Event) -> None:
