@@ -46,7 +46,7 @@ TRADER_STATE_TRANSITIONS: dict[TraderState, set[TraderState]] = {
     TraderState.LOGGED_IN: {TraderState.SETTLEMENT_QUERYING, TraderState.READY, TraderState.STOPPING},
     TraderState.SETTLEMENT_QUERYING: {TraderState.CONFIRMING_SETTLEMENT, TraderState.READY, TraderState.STOPPING},
     TraderState.CONFIRMING_SETTLEMENT: {TraderState.READY, TraderState.STOPPING},
-    TraderState.READY: {TraderState.CONNECTING, TraderState.STOPPING},
+    TraderState.READY: {TraderState.CONNECTING, TraderState.INIT, TraderState.STOPPING},
     TraderState.STOPPING: {TraderState.STOPPED},
     TraderState.STOPPED: {TraderState.INIT},
 }
@@ -74,6 +74,7 @@ class TraderEngine:
         self._stop_event = asyncio.Event()
         self._started = False
         self._pending_login_conn_id: int | None = None
+        self._pending_login_session_id: int | None = None
         self._login_request: LoginRequest | None = None
         self._order_conn_map: dict[str, int] = {}
         self._request_seq = 0
@@ -183,6 +184,7 @@ class TraderEngine:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         self._pending_login_conn_id = None
+        self._pending_login_session_id = None
         self._login_request = None
         self._query_pending.clear()
         self._order_conn_map.clear()
@@ -219,7 +221,6 @@ class TraderEngine:
     async def handle_event(self, event: Event) -> None:
         if event.type == "ws.connected":
             conn_id = event.conn_id or 0
-            self._set_state(TraderState.CONNECTED)
             await self._send_notify(conn_id, f"connected: {conn_id}")
             return
 
@@ -280,48 +281,8 @@ class TraderEngine:
             await self._on_query_result(event, "instrument")
             return
 
-        if event.type == "ctp.rsp_qry_trading_account_error":
-            self._notify_error("query trading account failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_investor_position_error":
-            self._notify_error("query investor position failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_order_error":
-            self._notify_error("query order failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_trade_error":
-            self._notify_error("query trade failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_instrument_error":
-            self._notify_error("query instrument failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_trading_account_error":
-            self._notify_error("query trading account failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_investor_position_error":
-            self._notify_error("query investor position failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_order_error":
-            self._notify_error("query order failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_trade_error":
-            self._notify_error("query trade failed", category="QUERY", data=event.payload)
-            return
-
-        if event.type == "ctp.rsp_qry_instrument_error":
-            self._notify_error("query instrument failed", category="QUERY", data=event.payload)
-            return
-
         if event.type == "ctp.rsp_settlement_info_confirm":
-            await self._broadcast_notify("settlement info confirmed", msg_type="SETTLEMENT")
+            await self._broadcast_notify("settlement info confirmed", msg_type=TraderNotifyType.SETTLEMENT)
             return
 
         if event.type == "ctp.rsp_order_insert":
@@ -435,6 +396,16 @@ class TraderEngine:
             return await self.handle_query_trade(req)
         if req.aid == "query_instrument":
             return await self.handle_query_instrument(req)
+        if req.aid == "peek_message":
+            return await self.handle_peek_message(req)
+        if req.aid == "qry_account_register":
+            return await self.handle_qry_account_register(req)
+        if req.aid == "qry_transfer_serial":
+            return await self.handle_qry_transfer_serial(req)
+        if req.aid == "req_transfer":
+            return await self.handle_req_transfer(req)
+        if req.aid == "change_password":
+            return await self.handle_change_password(req)
 
         handler = getattr(self, f"handle_{req.aid}", None)
         if handler is None:
@@ -454,6 +425,7 @@ class TraderEngine:
             return self._mk_response(req.aid, req, False, 400, "missing broker_id or front")
 
         self._pending_login_conn_id = req.conn_id
+        self._pending_login_session_id = self._next_request_id()
         self._login_request = login
         self._set_state(TraderState.CONNECTING)
 
@@ -463,6 +435,7 @@ class TraderEngine:
         except Exception as exc:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
+            self._pending_login_session_id = None
             self._login_request = None
             return self._mk_response(req.aid, req, False, 500, f"ctp connect failed: {exc}")
 
@@ -547,7 +520,6 @@ class TraderEngine:
         self._query_pending.clear()
         self._queue_system_notify("front disconnected", msg_type=TraderNotifyType.ERROR_SYSTEM, level="ERROR", data={"reason": event.payload.get("reason", 0)})
         if self.state not in {TraderState.STOPPING, TraderState.STOPPED}:
-            self._set_state(TraderState.READY)
             self._set_state(TraderState.INIT)
 
     async def _on_rsp_authenticate(self, event: Event) -> None:
@@ -558,6 +530,7 @@ class TraderEngine:
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
+            self._pending_login_session_id = None
             self._login_request = None
             request_id = int((self._query_pending.get("account", {}) or {}).get("request_id") or self._next_request_id())
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"authenticate failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=request_id)))
@@ -574,6 +547,7 @@ class TraderEngine:
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
+            self._pending_login_session_id = None
             self._login_request = None
             self._notify_error("login failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SYSTEM, data={"data": data, "error": error})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
@@ -594,6 +568,7 @@ class TraderEngine:
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
+            self._pending_login_session_id = None
             self._login_request = None
             self._notify_error("settlement confirm failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SETTLEMENT, data={"data": data, "error": error})
             await self._send_notify(conn_id, f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", code=int(error.get("ErrorID", 500) or 500), level="ERROR", msg_type=TraderNotifyType.SETTLEMENT, data={"data": data, "error": error})
@@ -916,6 +891,36 @@ class TraderEngine:
 
     def handle_echo(self, req: WsRequest) -> WsResponse:
         return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=req.request_id)
+
+    def _unsupported_aid_response(self, req: WsRequest, message: str | None = None) -> WsResponse:
+        msg = message or f"unsupported aid: {req.aid}"
+        self._notify_error(msg, code=501, category=TraderNotifyType.ERROR_SYSTEM, data={"aid": req.aid})
+        return self._mk_response(req.aid, req, False, 501, msg, {"aid": req.aid, "status": "unsupported"})
+
+    async def handle_peek_message(self, req: WsRequest) -> WsResponse:
+        if not self.is_running():
+            return self._mk_response(req.aid, req, False, 409, f"trader not running: {self.state.value}")
+        return self._unsupported_aid_response(req, "peek_message is not implemented yet")
+
+    async def handle_qry_account_register(self, req: WsRequest) -> WsResponse:
+        if not self.is_running():
+            return self._mk_response(req.aid, req, False, 409, f"trader not running: {self.state.value}")
+        return self._unsupported_aid_response(req, "qry_account_register is not implemented yet")
+
+    async def handle_qry_transfer_serial(self, req: WsRequest) -> WsResponse:
+        if not self.is_running():
+            return self._mk_response(req.aid, req, False, 409, f"trader not running: {self.state.value}")
+        return self._unsupported_aid_response(req, "qry_transfer_serial is not implemented yet")
+
+    async def handle_req_transfer(self, req: WsRequest) -> WsResponse:
+        if not self.is_running():
+            return self._mk_response(req.aid, req, False, 409, f"trader not running: {self.state.value}")
+        return self._unsupported_aid_response(req, "req_transfer is not implemented yet")
+
+    async def handle_change_password(self, req: WsRequest) -> WsResponse:
+        if not self.is_running():
+            return self._mk_response(req.aid, req, False, 409, f"trader not running: {self.state.value}")
+        return self._unsupported_aid_response(req, "change_password is not implemented yet")
 
     async def handle_insert_order(self, req: WsRequest, order: InsertOrderRequest) -> WsResponse:
         if not self._can_accept_order():
