@@ -138,7 +138,9 @@ class MdSpiBridge(MdSpiBase):
         results: list[dict[str, Any]] = []
         for symbol in items:
             ctp_symbol = self._to_ctp_instrument_id(symbol)
+            logger.info("market unsubscribe request symbol=%s instrument_id=%s", symbol, ctp_symbol)
             ret = self.unSubscribeMarketData(ctp_symbol)
+            logger.info("market unsubscribe call returned symbol=%s instrument_id=%s ret_code=%s", symbol, ctp_symbol, ret)
             results.append({"symbol": symbol, "instrument_id": ctp_symbol, "ret_code": ret})
             if ret != 0:
                 self.bus.publish_threadsafe(Event(type="market.unsubscribe.accepted", source="market", payload={"instrument_ids": items, "subscribed": sorted(self._subscribed), "results": results}))

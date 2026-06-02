@@ -32,7 +32,13 @@ class MarketConfig:
 
 
 class MarketEngine:
-    def __init__(self, bus: EventBus, feed: MarketFeedAdapter | None, config: MarketConfig, ws: WebSocketServer | None = None) -> None:
+    def __init__(
+            self,
+            bus: EventBus,
+            feed: MarketFeedAdapter | None,
+            config: MarketConfig,
+            ws: WebSocketServer | None = None
+    ) -> None:
         self.bus = bus
         self.feed = feed or MarketFeedAdapter(PybindMdApiAdapter(bus=bus), bus=bus)
         self.config = config
@@ -47,6 +53,7 @@ class MarketEngine:
         self._pending_login_conn_by_reqid: dict[int, int] = {}
         self._pending_login_conn_id: int | None = None
         self._pending_login_request_id: int | None = None
+        self._pending_unsubscribe_requests: dict[int, int] = {}
         self._login_timeout_task: asyncio.Task[None] | None = None
         self._on_quotes: Callable[[list[Quote]], Awaitable[None]] | None = None
         self._started = False
@@ -58,7 +65,8 @@ class MarketEngine:
             return
         self._started = True
         self.state_machine.transition_to(MarketState.INIT)
-        logger.info("market engine starting host=%s port=%s md_front=%s broker_id=%s", self.config.host, self.config.port, self.config.md_front, self.config.broker_id)
+        logger.info("market engine starting host=%s port=%s md_front=%s broker_id=%s",
+                    self.config.host, self.config.port, self.config.md_front, self.config.broker_id)
         await self.ws.start()
         self._event_queue = self.bus.subscribe()
         self._router_task = asyncio.create_task(self._event_router_loop(), name="market-event-router")
@@ -92,16 +100,25 @@ class MarketEngine:
         if conn_id is not None:
             self._pending_login_requests[conn_id] = self._pending_login_requests.get(conn_id, 0)
             self._pending_login_conn_id = conn_id
-        logger.info("market login request front=%s broker_id=%s user_name=%s appid=%s", login_req.front, login_req.broker_id, login_req.user_name, login_req.appid)
+        logger.info("market login request front=%s broker_id=%s user_name=%s appid=%s",
+                    login_req.front, login_req.broker_id, login_req.user_name, login_req.appid)
         self.state_machine.transition_to(MarketState.LOGGING_IN)
         try:
             if login_req.front and login_req.user_name and login_req.broker_id:
                 logger.info("market connecting front=%s", login_req.front)
-                self.feed.connect(login_req.front, login_req.user_name, login_req.password, login_req.broker_id, login_req.auth_code, login_req.appid)
+                self.feed.connect(
+                    login_req.front,
+                    login_req.user_name,
+                    login_req.password,
+                    login_req.broker_id,
+                    login_req.auth_code,
+                    login_req.appid
+                )
                 logger.info("market connect returned front=%s", login_req.front)
                 self._start_login_timeout_watchdog()
             else:
-                logger.warning("market login missing connect params front=%s broker_id=%s user_name=%s", login_req.front, login_req.broker_id, login_req.user_name)
+                logger.warning("market login missing connect params front=%s broker_id=%s user_name=%s",
+                               login_req.front, login_req.broker_id, login_req.user_name)
                 return False
         except Exception as exc:
             self._cancel_login_timeout_watchdog()
@@ -303,6 +320,7 @@ class MarketEngine:
             symbols = self._extract_symbols(req)
             logger.info("market unsubscribe conn_id=%s symbols=%s", conn_id, symbols)
             self.detach_client_subscription(conn_id, symbols)
+            self._pending_unsubscribe_requests[conn_id] = request_id
             await self.unsubscribe(*symbols)
             await self._send_market_response(conn_id, "market_unsubscribe", request_id, True, "accepted", {"symbols": symbols})
         else:
@@ -350,6 +368,12 @@ class MarketEngine:
             quote = event.payload.get("quote")
             if isinstance(quote, Quote):
                 asyncio.create_task(self.on_tick(quote))
+        elif event.type == "market.unsubscribe.finished":
+            conn_id = event.conn_id or 0
+            request_id = event.request_id or self._pending_unsubscribe_requests.pop(conn_id, 0)
+            logger.info("market unsubscribe finished conn_id=%s request_id=%s payload=%s", conn_id, request_id, event.payload)
+            if conn_id in self._pending_unsubscribe_requests:
+                self._pending_unsubscribe_requests.pop(conn_id, None)
         elif event.type == "ws.connected":
             conn_id = event.conn_id or 0
             asyncio.create_task(self._restore_client_subscriptions(conn_id))
@@ -391,9 +415,18 @@ class MarketEngine:
     @staticmethod
     def _serialize_quote_message(quote: Quote, symbol: str | None = None) -> str:
         resolved_symbol = symbol or quote.symbol
-        quote_data = asdict(quote) if is_dataclass(quote) else (quote.__dict__ if hasattr(quote, "__dict__") else quote)
+        if is_dataclass(quote):
+            quote_data = asdict(quote)
+        elif hasattr(quote, "__dict__"):
+            quote_data = dict(quote.__dict__)
+        else:
+            quote_data = quote
         if isinstance(quote_data, dict):
-            quote_data = {**quote_data, "symbol": resolved_symbol}
+            raw_data = quote_data.pop("raw", None)
+            if isinstance(raw_data, dict):
+                quote_data = {**raw_data, "symbol": resolved_symbol}
+            else:
+                quote_data["symbol"] = resolved_symbol
         payload = {
             "aid": "market_quote",
             "ok": True,
