@@ -61,13 +61,22 @@ class TraderEngine:
         self._request_seq += 1
         return self._request_seq
 
+    def _set_state(self, state: TraderState) -> None:
+        self.state = state
+
+    def is_ready(self) -> bool:
+        return self.state == TraderState.READY
+
+    def is_running(self) -> bool:
+        return self.state not in {TraderState.STOPPING, TraderState.STOPPED}
+
     async def start(self) -> None:
         if self._started:
             return
         self._started = True
         self.bus.bind_loop(asyncio.get_running_loop())
         await self.ws.start()
-        self.state = TraderState.READY
+        self._set_state(TraderState.READY)
         self._tasks.append(asyncio.create_task(self._event_loop(), name="trader-event-loop"))
         self._tasks.append(asyncio.create_task(self._idle_loop(), name="trader-idle-loop"))
 
@@ -77,7 +86,7 @@ class TraderEngine:
     async def stop(self) -> None:
         if self.state in {TraderState.STOPPING, TraderState.STOPPED}:
             return
-        self.state = TraderState.STOPPING
+        self._set_state(TraderState.STOPPING)
         self._stop_event.set()
         for task in self._tasks:
             task.cancel()
@@ -85,7 +94,7 @@ class TraderEngine:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         await self.ws.stop()
-        self.state = TraderState.STOPPED
+        self._set_state(TraderState.STOPPED)
 
     async def _event_loop(self) -> None:
         while self.state != TraderState.STOPPED:
@@ -228,15 +237,18 @@ class TraderEngine:
 
         self._pending_login_conn_id = req.conn_id
         self._login_request = login
-        self.state = TraderState.CONNECTING
+        self._set_state(TraderState.CONNECTING)
 
         try:
             self.ctp.connect(login.front, login.user_name, login.password, login.broker_id, login.auth_code, login.appid)
+            self._set_state(TraderState.AUTHENTICATING)
         except Exception as exc:
-            self.state = TraderState.READY
+            self._set_state(TraderState.READY)
+            self._pending_login_conn_id = None
+            self._login_request = None
             return self._mk_response(req.aid, req, False, 500, f"ctp connect failed: {exc}")
 
-        return self._mk_response(req.aid, req, True, 0, "login request accepted", {"user_name": login.user_name, "broker_id": login.broker_id, "front": login.front, "appid": login.appid, "auth_code": login.auth_code, "status": "connecting"})
+        return self._mk_response(req.aid, req, True, 0, "login request accepted", {"user_name": login.user_name, "broker_id": login.broker_id, "front": login.front, "appid": login.appid, "auth_code": login.auth_code, "status": self.state.value})
 
     async def handle_query_trading_account(self, req: WsRequest) -> WsResponse:
         try:
@@ -301,11 +313,13 @@ class TraderEngine:
         data = payload.get("data", {}) or {}
         conn_id = self._pending_login_conn_id or 0
         if int(error.get("ErrorID", 0)) != 0:
-            self.state = TraderState.READY
+            self._set_state(TraderState.READY)
+            self._pending_login_conn_id = None
+            self._login_request = None
             request_id = int((self._query_pending.get("account", {}) or {}).get("request_id") or self._next_request_id())
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"authenticate failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=request_id)))
             return
-        self.state = TraderState.AUTHENTICATING
+        self._set_state(TraderState.LOGGING_IN)
         self.ctp.login()
 
     async def _on_rsp_user_login(self, event: Event) -> None:
@@ -314,10 +328,12 @@ class TraderEngine:
         data = payload.get("data", {}) or {}
         conn_id = self._pending_login_conn_id or 0
         if int(error.get("ErrorID", 0)) != 0:
-            self.state = TraderState.READY
+            self._set_state(TraderState.READY)
+            self._pending_login_conn_id = None
+            self._login_request = None
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
-        self.state = TraderState.CONFIRMING_SETTLEMENT
+        self._set_state(TraderState.CONFIRMING_SETTLEMENT)
         await self.ws.send_to(conn_id, self.codec.build_notify(0, "login success, confirming settlement..."))
 
     async def _on_rsp_settlement_info_confirm(self, event: Event) -> None:
@@ -326,10 +342,12 @@ class TraderEngine:
         data = payload.get("data", {}) or {}
         conn_id = self._pending_login_conn_id or 0
         if int(error.get("ErrorID", 0)) != 0:
-            self.state = TraderState.READY
+            self._set_state(TraderState.READY)
+            self._pending_login_conn_id = None
+            self._login_request = None
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
-        self.state = TraderState.READY
+        self._set_state(TraderState.READY)
         if conn_id:
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=event.request_id)))
         self._pending_login_conn_id = None
@@ -535,16 +553,62 @@ class TraderEngine:
     def handle_echo(self, req: WsRequest) -> WsResponse:
         return WsResponse(aid="echo", ok=True, msg="ok", data={"raw": req.raw}, conn_id=req.conn_id, request_id=req.request_id)
 
+    async def handle_insert_order(self, req: WsRequest, order: InsertOrderRequest) -> WsResponse:
+        symbol = self._build_symbol(order.exchange_id, order.instrument_id)
+        direction = self._map_direction_from_request(order.direction, order.offset)
+        if direction is None:
+            return self._mk_response(req.aid, req, False, 400, f"unsupported direction/offset: {order.direction}/{order.offset}")
+        try:
+            order_ref = self.ctp.send_order(symbol, direction, order.price, order.volume)
+        except Exception as exc:
+            return self._mk_response(req.aid, req, False, 500, f"ctp send order failed: {exc}")
+        if order_ref:
+            self._order_conn_map[order_ref] = req.conn_id or 0
+        return self._mk_response(req.aid, req, True, 0, "insert order accepted", {
+            "order_ref": order_ref,
+            "symbol": symbol,
+            "direction": direction,
+            "price": order.price,
+            "volume": order.volume,
+            "status": "accepted",
+        })
+
+    async def handle_cancel_order(self, req: WsRequest, cancel: CancelOrderRequest) -> WsResponse:
+        if not cancel.order_id:
+            return self._mk_response(req.aid, req, False, 400, "missing order_id")
+        try:
+            self.ctp.cancel_order(cancel.order_id, cancel.exchange_id, cancel.instrument_id)
+        except Exception as exc:
+            return self._mk_response(req.aid, req, False, 500, f"ctp cancel order failed: {exc}")
+        if req.conn_id is not None:
+            self._order_conn_map.setdefault(cancel.order_id, req.conn_id)
+        return self._mk_response(req.aid, req, True, 0, "cancel order accepted", {
+            "order_id": cancel.order_id,
+            "exchange_id": cancel.exchange_id,
+            "instrument_id": cancel.instrument_id,
+            "status": "accepted",
+        })
+
     @staticmethod
-    def _map_direction(direction: str, offset: str) -> str | None:
-        d = direction.upper()
-        o = offset.upper()
-        if d == "BUY" and o == "OPEN":
+    def _build_symbol(exchange_id: str, instrument_id: str) -> str:
+        exchange_id = exchange_id.strip().upper()
+        instrument_id = instrument_id.strip()
+        if not exchange_id:
+            return instrument_id
+        if exchange_id == "SHFE":
+            instrument_id = instrument_id.lower()
+        return f"{exchange_id}.{instrument_id}"
+
+    @staticmethod
+    def _map_direction_from_request(direction: Any, offset: Any) -> str | None:
+        d = str(direction).upper()
+        o = str(offset).upper()
+        if d in {"BUY", "DIRECTIONBUY"} and o in {"OPEN", "OFFSETOPEN"}:
             return "BUY_OPEN"
-        if d == "BUY" and o in {"CLOSE", "CLOSE_TODAY"}:
-            return "BUY_CLOSE_TODAY" if o == "CLOSE_TODAY" else "BUY_CLOSE"
-        if d == "SELL" and o == "OPEN":
+        if d in {"BUY", "DIRECTIONBUY"} and o in {"CLOSE", "CLOSETODAY", "CLOSE_TODAY", "OFFSETCLOSE"}:
+            return "BUY_CLOSE_TODAY" if o in {"CLOSETODAY", "CLOSE_TODAY"} else "BUY_CLOSE"
+        if d in {"SELL", "DIRECTIONSELL"} and o in {"OPEN", "OFFSETOPEN"}:
             return "SELL_OPEN"
-        if d == "SELL" and o in {"CLOSE", "CLOSE_TODAY"}:
-            return "SELL_CLOSE_TODAY" if o == "CLOSE_TODAY" else "SELL_CLOSE"
+        if d in {"SELL", "DIRECTIONSELL"} and o in {"CLOSE", "CLOSETODAY", "CLOSE_TODAY", "OFFSETCLOSE"}:
+            return "SELL_CLOSE_TODAY" if o in {"CLOSETODAY", "CLOSE_TODAY"} else "SELL_CLOSE"
         return None
