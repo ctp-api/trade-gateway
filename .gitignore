@@ -7,6 +7,8 @@ venv/
 ENV/
 .venv
 
+.mypy_cache
+
 # IDE
 .vscode/
 .idea/
@@ -45,3 +47,5 @@ WS_PROTOCOL.md
 /Python重写版项目初始化代码骨架.md
 /Python重写版详细架构设计.md
 /Python 重写实施 TODO 列表.md
+/Python重写版开发任务清单.md
+/逐模块重写差距清单.md
