@@ -9,6 +9,9 @@ from pyctp.gateway.protocol.types import (
     InsertOrderRequest,
     LoginRequest,
     MarketLoginRequest,
+    MessageAid,
+    NotifyData,
+    RtnDataEnvelope,
     WsRequest,
     WsResponse,
 )
@@ -31,7 +34,13 @@ class ProtocolCodec:
         aid = str(data.get("aid", ""))
         if not aid:
             raise ValueError("missing aid")
-        return WsRequest(aid=aid, conn_id=conn_id, request_id=None, raw=data)
+        request_id = data.get("request_id")
+        return WsRequest(
+            aid=aid,
+            conn_id=conn_id,
+            request_id=int(request_id) if request_id is not None else None,
+            raw=data,
+        )
 
     @staticmethod
     def _payload(req: WsRequest) -> dict[str, Any]:
@@ -40,13 +49,20 @@ class ProtocolCodec:
             raise ValueError("missing data payload")
         return payload
 
+    @staticmethod
+    def _string_or_none(data: dict[str, Any], key: str) -> str | None:
+        value = data.get(key)
+        if value is None:
+            return None
+        return str(value)
+
     def parse_login(self, req: WsRequest) -> LoginRequest:
         data = self._payload(req)
         return LoginRequest(
             user_name=str(data.get("user_name", "")),
             password=str(data.get("password", "")),
-            broker_id=(str(data["broker_id"]) if data.get("broker_id") is not None else None),
-            front=(str(data["front"]) if data.get("front") is not None else None),
+            broker_id=self._string_or_none(data, "broker_id"),
+            front=self._string_or_none(data, "front"),
             auth_code=str(data.get("auth_code", "")),
             appid=str(data.get("appid", "")),
         )
@@ -56,8 +72,8 @@ class ProtocolCodec:
         return MarketLoginRequest(
             user_name=str(data.get("user_name", "")),
             password=str(data.get("password", "")),
-            broker_id=(str(data["broker_id"]) if data.get("broker_id") is not None else None),
-            front=(str(data["front"]) if data.get("front") is not None else None),
+            broker_id=self._string_or_none(data, "broker_id"),
+            front=self._string_or_none(data, "front"),
             auth_code=str(data.get("auth_code", "")),
             appid=str(data.get("appid", "")),
         )
@@ -73,6 +89,9 @@ class ProtocolCodec:
             price=float(data.get("price", 0.0)),
             price_type=str(data.get("price_type", "limit")),
             close_today_prior=bool(data.get("close_today_prior", False)),
+            order_id=str(data.get("order_id", "")),
+            user_id=str(data.get("user_id", "")),
+            limit_price=float(data.get("limit_price", data.get("price", 0.0)) or 0.0),
         )
 
     def parse_cancel_order(self, req: WsRequest) -> CancelOrderRequest:
@@ -86,11 +105,20 @@ class ProtocolCodec:
     def build_response(self, response: WsResponse) -> str:
         return self.dumps(response)
 
-    def build_notify(self, code: int, msg: str, level: str = "INFO", msg_type: str = "NOTIFY") -> str:
+    def build_notify(self, code: int, msg: str, level: str = "INFO", msg_type: str = "MESSAGE") -> str:
+        return self.dumps(NotifyData(code=code, msg=msg, level=level, msg_type=msg_type))
+
+    def build_rtn_data(self, data: dict[str, Any]) -> str:
+        return self.dumps(RtnDataEnvelope(data=data))
+
+    def build_brokers(self, brokers: list[dict[str, Any]]) -> str:
         return self.dumps({
-            "aid": "notify",
-            "code": code,
-            "msg": msg,
-            "level": level,
-            "msg_type": msg_type,
+            "aid": MessageAid.RTN_BROKERS.value,
+            "brokers": brokers,
+        })
+
+    def build_settlement_notify(self, content: str) -> str:
+        return self.dumps({
+            "aid": MessageAid.RTN_DATA.value,
+            "data": [{"trade": {"settlement": content}}],
         })
