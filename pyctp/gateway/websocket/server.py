@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -21,8 +22,16 @@ class WebSocketServer:
         self._server: websockets.server.Serve | None = None
         self._connections = ConnectionManager()
         self._sender_task: asyncio.Task[None] | None = None
+        self._started = False
+
+    @property
+    def connection_count(self) -> int:
+        return self._connections.count()
 
     async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
         self._server = await websockets.serve(self._handle_client, self.host, self.port)
         self._sender_task = asyncio.create_task(self._send_loop(), name="ws-send-loop")
         logger.info("websocket server started on %s:%s", self.host, self.port)
@@ -32,6 +41,7 @@ class WebSocketServer:
             self._sender_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._sender_task
+            self._sender_task = None
         for session in self._connections.all():
             await session.close()
         self._connections = ConnectionManager()
@@ -39,6 +49,7 @@ class WebSocketServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._started = False
 
     async def broadcast(self, msg: str) -> None:
         for session in self._connections.all():
@@ -48,6 +59,9 @@ class WebSocketServer:
         session = self._connections.get(conn_id)
         if session is not None:
             await session.send(msg)
+
+    def get_connection(self, conn_id: int) -> Any | None:
+        return self._connections.get(conn_id)
 
     async def _handle_client(self, websocket: WebSocketServerProtocol) -> None:
         remote_addr = str(getattr(websocket, "remote_address", "unknown"))
@@ -61,6 +75,7 @@ class WebSocketServer:
                 await self.bus.publish(Event(type="ws.message", source="websocket", conn_id=session.conn_id, payload={"message": message}))
         except Exception as exc:
             logger.exception("websocket client error: %s", exc)
+            await self.bus.publish(Event(type="ws.error", source="websocket", conn_id=session.conn_id, payload={"error": str(exc)}))
         finally:
             await self.bus.publish(Event(type="ws.disconnected", source="websocket", conn_id=session.conn_id, payload={"remote_addr": remote_addr}))
             self._connections.remove(session.conn_id)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from typing import Any
 
 from websockets.server import WebSocketServerProtocol
 
@@ -38,14 +39,14 @@ class ConnectionManager:
         async with self._lock:
             conn_id = self._next_id
             self._next_id += 1
-        session = ConnectionSession(
-            conn_id=conn_id,
-            websocket=websocket,
-            remote_addr=remote_addr,
-            send_queue=asyncio.Queue(maxsize=256),
-        )
-        self._sessions[conn_id] = session
-        return session
+            session = ConnectionSession(
+                conn_id=conn_id,
+                websocket=websocket,
+                remote_addr=remote_addr,
+                send_queue=asyncio.Queue(maxsize=256),
+            )
+            self._sessions[conn_id] = session
+            return session
 
     def get(self, conn_id: int) -> ConnectionSession | None:
         return self._sessions.get(conn_id)
@@ -55,3 +56,6 @@ class ConnectionManager:
 
     def all(self) -> list[ConnectionSession]:
         return list(self._sessions.values())
+
+    def count(self) -> int:
+        return len(self._sessions)
