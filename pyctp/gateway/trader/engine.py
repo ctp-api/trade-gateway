@@ -38,7 +38,7 @@ class TraderState(str, Enum):
 
 TRADER_STATE_TRANSITIONS: dict[TraderState, set[TraderState]] = {
     TraderState.INIT: {TraderState.CONNECTING, TraderState.STOPPING},
-    TraderState.CONNECTING: {TraderState.CONNECTED, TraderState.READY, TraderState.STOPPING, TraderState.INIT},
+    TraderState.CONNECTING: {TraderState.CONNECTED, TraderState.AUTHENTICATING, TraderState.READY, TraderState.STOPPING, TraderState.INIT},
     TraderState.CONNECTED: {TraderState.AUTHENTICATING, TraderState.READY, TraderState.STOPPING},
     TraderState.AUTHENTICATING: {TraderState.AUTHENTICATED, TraderState.READY, TraderState.STOPPING},
     TraderState.AUTHENTICATED: {TraderState.LOGGING_IN, TraderState.READY, TraderState.STOPPING},
@@ -153,6 +153,14 @@ class TraderEngine:
         if meta:
             payload.update(meta)
         self._queue_system_notify(f"trading day changed: {before} -> {after}", msg_type=self._notify_type_value(TraderNotifyType.TRADING_DAY), data=payload)
+
+    def _notify_login_stage(self, stage: str, conn_id: int | None = None, meta: dict[str, Any] | None = None) -> None:
+        payload = {"stage": stage}
+        if conn_id is not None:
+            payload["conn_id"] = conn_id
+        if meta:
+            payload.update(meta)
+        self._queue_system_notify(f"login stage: {stage}", msg_type=self._notify_type_value(TraderNotifyType.STATE), data=payload)
 
     def _login_session_active(self, conn_id: int | None = None, session_id: int | None = None) -> bool:
         if self._pending_login_conn_id is None or self._pending_login_session_id is None:
@@ -477,10 +485,12 @@ class TraderEngine:
         self._pending_login_session_id = self._next_request_id()
         self._login_request = login
         self._set_state(TraderState.CONNECTING)
+        self._notify_login_stage("connecting", req.conn_id, {"front": login.front, "broker_id": login.broker_id, "user_name": login.user_name})
 
         try:
             self.ctp.connect(login.front, login.user_name, login.password, login.broker_id, login.auth_code, login.appid)
             self._set_state(TraderState.AUTHENTICATING)
+            self._notify_login_stage("authenticating", req.conn_id, {"front": login.front, "broker_id": login.broker_id, "user_name": login.user_name})
         except Exception as exc:
             self._set_state(TraderState.READY)
             self._pending_login_conn_id = None
@@ -578,8 +588,10 @@ class TraderEngine:
         conn_id = self._pending_login_conn_id or 0
         if not self._login_session_active(conn_id=conn_id):
             return
+        self._notify_login_stage("authenticate_rsp", conn_id, {"error": error, "data": data})
         if int(error.get("ErrorID", 0)) != 0:
             self._set_state(TraderState.READY)
+            self._notify_login_stage("authenticate_failed", conn_id, {"error": error, "data": data})
             self._pending_login_conn_id = None
             self._pending_login_session_id = None
             self._login_request = None
@@ -587,7 +599,9 @@ class TraderEngine:
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"authenticate failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=request_id)))
             return
         self._set_state(TraderState.AUTHENTICATED)
+        self._notify_login_stage("authenticated", conn_id, {"error": error, "data": data})
         self._set_state(TraderState.LOGGING_IN)
+        self._notify_login_stage("logging_in", conn_id, {"error": error, "data": data})
         self.ctp.login()
 
     async def _on_rsp_user_login(self, event: Event) -> None:
@@ -602,14 +616,18 @@ class TraderEngine:
             self._pending_login_conn_id = None
             self._pending_login_session_id = None
             self._login_request = None
+            self._notify_login_stage("login_failed", conn_id, {"error": error, "data": data})
             self._notify_error("login failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SYSTEM, data={"data": data, "error": error})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"login failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self._set_state(TraderState.LOGGED_IN)
+        self._notify_login_stage("logged_in", conn_id, {"error": error, "data": data})
         self._queue_system_notify("user logged in", msg_type=TraderNotifyType.STATE, data={"stage": "logged_in"})
         self._set_state(TraderState.SETTLEMENT_QUERYING)
+        self._notify_login_stage("settlement_querying", conn_id, {"error": error, "data": data})
         self._queue_system_notify("settlement querying started", msg_type=TraderNotifyType.SETTLEMENT, data={"stage": "querying"})
         self._set_state(TraderState.CONFIRMING_SETTLEMENT)
+        self._notify_login_stage("confirming_settlement", conn_id, {"error": error, "data": data})
         self._queue_system_notify("settlement confirming started", msg_type=TraderNotifyType.SETTLEMENT, data={"stage": "confirming"})
         await self._send_notify(conn_id, "login success, confirming settlement...")
 
@@ -623,16 +641,19 @@ class TraderEngine:
             self._pending_login_conn_id = None
             self._pending_login_session_id = None
             self._login_request = None
+            self._notify_login_stage("settlement_confirm_failed", conn_id, {"error": error, "data": data})
             self._notify_error("settlement confirm failed", code=int(error.get("ErrorID", 500) or 500), category=TraderNotifyType.ERROR_SETTLEMENT, data={"data": data, "error": error})
             await self._send_notify(conn_id, f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", code=int(error.get("ErrorID", 500) or 500), level="ERROR", msg_type=TraderNotifyType.SETTLEMENT, data={"data": data, "error": error})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=False, code=500, msg=f"settlement confirm failed: {error.get('ErrorMsg', 'unknown')}", data={"data": data, "error": error}, conn_id=conn_id, request_id=event.request_id)))
             return
         self._set_state(TraderState.READY)
+        self._notify_login_stage("ready", conn_id, {"error": error, "data": data})
         self._queue_system_notify("settlement confirmed", msg_type=TraderNotifyType.SETTLEMENT, data={"status": "confirmed"})
         if conn_id:
             await self._send_notify(conn_id, "login success", msg_type=TraderNotifyType.SETTLEMENT, data={"status": "ready"})
             await self.ws.send_to(conn_id, self.codec.build_response(WsResponse(aid="req_login", ok=True, code=0, msg="login success", data={"data": data, "error": error, "status": "ready"}, conn_id=conn_id, request_id=event.request_id)))
         self._pending_login_conn_id = None
+        self._pending_login_session_id = None
         self._login_request = None
         self._save_persistence()
 
