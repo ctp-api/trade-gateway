@@ -270,7 +270,7 @@ class TraderEngine:
     async def handle_event(self, event: Event) -> None:
         if event.type == "ws.connected":
             conn_id = event.conn_id or 0
-            await self._send_notify(conn_id, f"connected: {conn_id}")
+            await self._send_notify(conn_id, f"connected: {conn_id}", msg_type=TraderNotifyType.NOTIFY)
             return
 
         if event.type == "ws.message":
@@ -416,11 +416,11 @@ class TraderEngine:
             data=payload,
         )
 
-    async def _send_notify(self, conn_id: int, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
+    async def _send_notify(self, conn_id: int, msg: str, code: int = 0, level: str = "INFO", msg_type: TraderNotifyType | str = TraderNotifyType.NOTIFY, data: dict[str, Any] | None = None) -> None:
         if conn_id:
             await self._send_notify_payload(conn_id, self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
 
-    async def _broadcast_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: str = "NOTIFY", data: dict[str, Any] | None = None) -> None:
+    async def _broadcast_notify(self, msg: str, code: int = 0, level: str = "INFO", msg_type: TraderNotifyType | str = TraderNotifyType.NOTIFY, data: dict[str, Any] | None = None) -> None:
         await self._broadcast_notify_payload(self._build_notify_payload(msg=msg, code=code, level=level, msg_type=msg_type, data=data))
 
     async def dispatch_request(self, req: WsRequest) -> WsResponse:

@@ -260,6 +260,8 @@ class MarketEngine:
                     await self.ws.send_to(conn_id, self.codec.dumps(GatewayNotify(msg=f"connected: {conn_id}", msg_type=GatewayNotifyType.NOTIFY, code=0, level="INFO", data={}).to_payload()))
                 elif event.type == "market.front_connected":
                     logger.info("market front connected")
+                    conn_id = event.conn_id or 0
+                    await self._send_market_notify(conn_id, "front connected", msg_type=GatewayNotifyType.NOTIFY, data={"conn_id": conn_id})
                 elif event.type == "market.login_rsp":
                     error = event.payload.get("error") or {}
                     ok = int(error.get("ErrorID", 0)) == 0
@@ -317,6 +319,7 @@ class MarketEngine:
                 self._pending_login_requests.pop(conn_id, None)
                 if self._pending_login_request_id == request_id:
                     self._pending_login_request_id = None
+                await self._send_market_notify(conn_id, "login rejected", code=500, level="ERROR", msg_type=GatewayNotifyType.ERROR_SYSTEM, data={"status": str(self.state_machine.get_state()), "request_id": request_id})
                 await self._send_market_response(conn_id, "market_login", request_id, False, "login rejected", {"status": str(self.state_machine.get_state())}, code=500)
         elif req.aid == "market_subscribe":
             symbols = self._extract_symbols(req)
@@ -334,6 +337,7 @@ class MarketEngine:
             await self._send_market_response(conn_id, "market_unsubscribe", request_id, True, "accepted", {"symbols": symbols})
         else:
             logger.warning("market unsupported aid=%s conn_id=%s", req.aid, conn_id)
+            await self._send_market_notify(conn_id, f"unsupported aid: {req.aid}", code=404, level="ERROR", msg_type=GatewayNotifyType.ERROR_SYSTEM, data={"aid": req.aid, "request_id": request_id})
             await self._send_market_response(conn_id, req.aid, request_id, False, f"unsupported aid: {req.aid}", code=404)
 
     async def _push_quote_to_clients(self, quote: Quote) -> None:
