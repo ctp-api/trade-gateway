@@ -23,6 +23,22 @@ class GatewayNotifyType(str, Enum):
     ERROR_SETTLEMENT = "ERROR.SETTLEMENT"
 
 
+class GatewayLoginStage(str, Enum):
+    CONNECTING = "connecting"
+    AUTHENTICATING = "authenticating"
+    AUTHENTICATE_RSP = "authenticate_rsp"
+    AUTHENTICATE_OK = "authenticate_ok"
+    LOGIN_REQUEST_SENT = "login_request_sent"
+    USER_LOGIN_RSP = "user_login_rsp"
+    SETTLEMENT_QUERYING = "settlement_querying"
+    CONFIRMING_SETTLEMENT = "confirming_settlement"
+    READY = "ready"
+    CONNECT_FAILED = "connect_failed"
+    AUTHENTICATE_FAILED = "authenticate_failed"
+    LOGIN_FAILED = "login_failed"
+    SETTLEMENT_CONFIRM_FAILED = "settlement_confirm_failed"
+
+
 @dataclass(slots=True)
 class GatewayNotify:
     msg: str

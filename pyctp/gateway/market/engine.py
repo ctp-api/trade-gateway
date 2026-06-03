@@ -10,7 +10,7 @@ from typing import Awaitable, Callable
 from pyctp.gateway.eventbus.bus import Event, EventBus
 from pyctp.gateway.market.adapter import MarketFeedAdapter, PybindMdApiAdapter
 from pyctp.gateway.market.models import MarketState, MarketStateMachine, Quote, QuoteStore
-from pyctp.gateway.notify import GatewayNotify, GatewayNotifyType
+from pyctp.gateway.notify import GatewayLoginStage, GatewayNotify, GatewayNotifyType
 from pyctp.gateway.protocol import ProtocolCodec
 from pyctp.gateway.protocol.types import MarketLoginRequest, WsRequest
 from pyctp.gateway.websocket import WebSocketServer
