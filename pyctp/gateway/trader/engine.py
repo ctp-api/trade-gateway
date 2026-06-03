@@ -77,6 +77,7 @@ class TraderEngine:
         self._pending_login_session_id: int | None = None
         self._login_request: LoginRequest | None = None
         self._order_conn_map: dict[str, int] = {}
+        self._order_session_map: dict[str, int] = {}
         self._request_seq = 0
         self._query_pending: dict[str, dict[str, Any]] = {}
         self._query_results: dict[str, list[dict[str, Any]]] = {}
@@ -164,11 +165,47 @@ class TraderEngine:
             return False
         return True
 
+    def _query_session_active(self, kind: str, pending: dict[str, Any]) -> bool:
+        request_id = int(pending.get("request_id") or 0)
+        if request_id <= 0:
+            return False
+        if kind not in self._query_pending:
+            return False
+        if self.state in {TraderState.STOPPING, TraderState.STOPPED, TraderState.INIT}:
+            return False
+        return True
+
     def is_ready(self) -> bool:
         return self.state == TraderState.READY
 
     def is_running(self) -> bool:
         return self.state not in {TraderState.STOPPING, TraderState.STOPPED}
+
+    def _order_session_active(self, order_ref: str, conn_id: int | None = None) -> bool:
+        if order_ref not in self._order_session_map:
+            return False
+        if conn_id is not None and self._order_conn_map.get(order_ref) not in {0, conn_id}:
+            return False
+        if self.state in {TraderState.STOPPING, TraderState.STOPPED, TraderState.INIT}:
+            return False
+        return True
+
+    def _clear_order_session(self, order_ref: str) -> None:
+        self._order_session_map.pop(order_ref, None)
+        self._order_conn_map.pop(order_ref, None)
+
+    def _query_session_active(self, kind: str, pending: dict[str, Any]) -> bool:
+        request_id = int(pending.get("request_id") or 0)
+        if request_id <= 0:
+            return False
+        if kind not in self._query_pending:
+            return False
+        if self.state in {TraderState.STOPPING, TraderState.STOPPED, TraderState.INIT}:
+            return False
+        return True
+
+    def _clear_query_session(self, kind: str) -> None:
+        self._query_pending.pop(kind, None)
 
     async def start(self) -> None:
         if self._started:
@@ -199,6 +236,7 @@ class TraderEngine:
         self._login_request = None
         self._query_pending.clear()
         self._order_conn_map.clear()
+        self._order_session_map.clear()
         await self.ws.stop()
         self._set_state(TraderState.STOPPED)
 
@@ -604,6 +642,8 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         last = bool(payload.get("last", False))
         pending = self._query_pending.setdefault(kind, {})
+        if not self._query_session_active(kind, pending):
+            return
         if int(error.get("ErrorID", 0)) == 0:
             pending.setdefault("rows", []).append(data)
         if not last:
@@ -673,7 +713,7 @@ class TraderEngine:
             if self._last_trading_day and current_day and self._last_trading_day != current_day:
                 self._notify_trading_day_change(self._last_trading_day, current_day, meta={"kind": "account.query"})
             self._last_trading_day = current_day or self._last_trading_day
-        self._query_pending.pop(kind, None)
+        self._clear_query_session(kind)
 
     async def _on_rsp_order_insert(self, event: Event) -> None:
         payload = event.payload
@@ -681,6 +721,8 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if not self._order_session_active(order_ref, conn_id=conn_id):
+            return
         before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
         if int(error.get("ErrorID", 0)) != 0:
             await self._send_order_error(conn_id, "rsp_order_insert", order_ref, data, error)
@@ -688,6 +730,7 @@ class TraderEngine:
             return
         after_status = str(data.get("OrderStatus", "insert_submitted") or "insert_submitted")
         if order_ref and before_status != after_status:
+            self._order_session_map[order_ref] = int(event.request_id or self._next_request_id())
             self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rsp_order_insert"})
         await self._push_order_event(conn_id, "rsp_order_insert", data)
 
@@ -705,6 +748,8 @@ class TraderEngine:
         error = payload.get("error", {}) or {}
         order_ref = str(data.get("OrderRef", "") or data.get("order_ref", "") or "")
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if not self._order_session_active(order_ref, conn_id=conn_id):
+            return
         before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
         if int(error.get("ErrorID", 0)) != 0:
             await self._send_order_error(conn_id, "rsp_order_action", order_ref, data, error)
@@ -713,16 +758,22 @@ class TraderEngine:
         after_status = str(data.get("OrderStatus", "cancel_submitted") or "cancel_submitted")
         if order_ref and before_status != after_status:
             self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rsp_order_action"})
+        if after_status in {"all_traded", "canceled", "rejected"}:
+            self._clear_order_session(order_ref)
         await self._push_order_event(conn_id, "rsp_order_action", data)
 
     async def _on_rtn_order(self, event: Event) -> None:
         data = event.payload.get("data", {}) or {}
         order_ref = str(data.get("OrderRef", ""))
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if not self._order_session_active(order_ref, conn_id=conn_id):
+            return
         before_status = str(self.ctp.order_status_map.get(order_ref, "")) if hasattr(self.ctp, "order_status_map") else ""
         after_status = str(data.get("OrderStatus", "") or "")
         if order_ref and before_status != after_status:
             self._notify_order_status_change(order_ref, before_status, after_status, meta={"event": "rtn_order"})
+        if after_status in {"all_traded", "canceled", "rejected"}:
+            self._clear_order_session(order_ref)
         await self.ws.broadcast(self.codec.dumps({"aid": "rtn_order", "ok": True, "data": data}))
         if conn_id:
             await self._send_notify(conn_id, "rtn_order received", msg_type="ORDER")
@@ -731,8 +782,12 @@ class TraderEngine:
         data = event.payload.get("data", {}) or {}
         order_ref = str(data.get("OrderRef", ""))
         conn_id = self._order_conn_map.get(order_ref, self._pending_login_conn_id or 0)
+        if not self._order_session_active(order_ref, conn_id=conn_id):
+            return
         if order_ref:
             self._notify_order_status_change(order_ref, "", "part_traded", meta={"event": "rtn_trade"})
+        if str(data.get("OrderStatus", "")) in {"all_traded", "canceled", "rejected"}:
+            self._clear_order_session(order_ref)
         await self.ws.broadcast(self.codec.dumps({"aid": "rtn_trade", "ok": True, "data": data}))
         if conn_id:
             await self._send_notify(conn_id, "rtn_trade received", msg_type="TRADE")

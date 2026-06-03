@@ -10,6 +10,7 @@ from typing import Awaitable, Callable
 from pyctp.gateway.eventbus.bus import Event, EventBus
 from pyctp.gateway.market.adapter import MarketFeedAdapter, PybindMdApiAdapter
 from pyctp.gateway.market.models import MarketState, MarketStateMachine, Quote, QuoteStore
+from pyctp.gateway.notify import GatewayNotify, GatewayNotifyType
 from pyctp.gateway.protocol import ProtocolCodec
 from pyctp.gateway.protocol.types import MarketLoginRequest, WsRequest
 from pyctp.gateway.websocket import WebSocketServer
@@ -252,7 +253,7 @@ class MarketEngine:
                     await self._handle_ws_message(event)
                 elif event.type == "ws.connected":
                     conn_id = event.conn_id or 0
-                    await self.ws.send_to(conn_id, self.codec.build_notify(0, "market ready"))
+                    await self.ws.send_to(conn_id, self.codec.dumps({"aid": "notify", "ok": True, "code": 0, "msg": f"connected: {conn_id}", "level": "INFO", "msg_type": "NOTIFY", "data": {}}))
                 elif event.type == "market.front_connected":
                     logger.info("market front connected")
                 elif event.type == "market.login_rsp":
