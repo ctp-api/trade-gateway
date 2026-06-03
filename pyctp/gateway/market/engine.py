@@ -253,7 +253,7 @@ class MarketEngine:
                     await self._handle_ws_message(event)
                 elif event.type == "ws.connected":
                     conn_id = event.conn_id or 0
-                    await self.ws.send_to(conn_id, self.codec.dumps({"aid": "notify", "ok": True, "code": 0, "msg": f"connected: {conn_id}", "level": "INFO", "msg_type": "NOTIFY", "data": {}}))
+                    await self.ws.send_to(conn_id, self.codec.dumps(GatewayNotify(msg=f"connected: {conn_id}", msg_type=GatewayNotifyType.NOTIFY, code=0, level="INFO", data={}).to_payload()))
                 elif event.type == "market.front_connected":
                     logger.info("market front connected")
                 elif event.type == "market.login_rsp":
