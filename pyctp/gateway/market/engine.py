@@ -187,6 +187,7 @@ class MarketEngine:
                 request_id = self._pending_login_request_id or self._pending_login_requests.get(conn_id, 0)
                 logger.warning("market login timeout after %.1fs conn_id=%s request_id=%s", timeout_seconds, conn_id, request_id)
                 self.state_machine.transition_to(MarketState.INIT)
+                await self._send_market_notify(conn_id, "login timeout", code=504, level="ERROR", msg_type=GatewayNotifyType.ERROR_SYSTEM, data={"status": "timeout", "timeout_seconds": timeout_seconds, "request_id": request_id})
                 await self._send_market_response(conn_id, "market_login", request_id, False, "login timeout", {"status": "timeout", "timeout_seconds": timeout_seconds}, code=504)
                 self._pending_login_conn_id = None
                 self._pending_login_request_id = None
@@ -211,6 +212,9 @@ class MarketEngine:
         }
         logger.info("market response conn_id=%s aid=%s ok=%s msg=%s data=%s", conn_id, aid, ok, msg, data)
         await self.ws.send_to(conn_id, self.codec.dumps(payload))
+
+    async def _send_market_notify(self, conn_id: int, msg: str, *, code: int = 0, level: str = "INFO", msg_type: GatewayNotifyType | str = GatewayNotifyType.NOTIFY, data: dict[str, object] | None = None) -> None:
+        await self.ws.send_to(conn_id, self.codec.dumps(GatewayNotify(msg=msg, msg_type=msg_type, code=code, level=level, data=data or {}).to_payload()))
 
     async def _event_router_loop(self) -> None:
         assert self._event_queue is not None
@@ -267,6 +271,7 @@ class MarketEngine:
                         logger.info("market login rsp success reqid=%s conn_id=%s", reqid, conn_id)
                         self._cancel_login_timeout_watchdog()
                         self.state_machine.transition_to(MarketState.READY)
+                        await self._send_market_notify(conn_id, "login success", msg_type=GatewayNotifyType.NOTIFY, data={"status": "ready", "request_id": reqid})
                         await self._send_market_response(conn_id, "market_login", reqid, True, "login success", {"status": "ready"})
                         await self._restore_subscriptions()
                         await self._restore_client_subscriptions(conn_id)
@@ -274,12 +279,14 @@ class MarketEngine:
                         logger.warning("market login rsp error=%s", error)
                         self._cancel_login_timeout_watchdog()
                         self.state_machine.transition_to(MarketState.INIT)
+                        await self._send_market_notify(conn_id, str(error.get("ErrorMsg", "login failed")), code=int(error.get("ErrorID", 500)) or 500, level="ERROR", msg_type=GatewayNotifyType.ERROR_SYSTEM, data={"error": error, "request_id": reqid})
                         await self._send_market_response(conn_id, "market_login", reqid, False, str(error.get("ErrorMsg", "login failed")), {"error": error}, code=int(error.get("ErrorID", 500)) or 500)
                     self._pending_login_conn_id = None
                 elif event.type == "ws.disconnected":
                     conn_id = event.conn_id or 0
                     logger.info("market ws disconnected conn_id=%s", conn_id)
                     self._conn_subscriptions.pop(conn_id, None)
+                    await self._send_market_notify(conn_id, f"disconnected: {conn_id}", msg_type=GatewayNotifyType.NOTIFY, data={"conn_id": conn_id})
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -294,6 +301,7 @@ class MarketEngine:
             req = self.codec.parse_request(raw, conn_id=conn_id)
         except Exception as exc:
             logger.exception("market request parse failed conn_id=%s", conn_id)
+            await self._send_market_notify(conn_id, str(exc), code=400, level="ERROR", msg_type=GatewayNotifyType.ERROR_SYSTEM, data={"conn_id": conn_id})
             await self._send_market_response(conn_id, "error", None, False, str(exc), code=400)
             return
         request_id = req.request_id or 1
